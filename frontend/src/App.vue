@@ -14,7 +14,8 @@ const model_id = ref("meta-llama/Llama-2-7b-hf");
 const hardware = ref("nvidia_A6000");
 const global_update_trigger = ref(1);
 const total_results = ref({});
-const ip_port = ref("api.llm-viewer.com");
+//const ip_port = ref("api.llm-viewer.com");
+const ip_port = ref("127.0.0.1:100");
 
 provide("model_id", model_id);
 provide("hardware", hardware);
