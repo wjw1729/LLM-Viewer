@@ -4,6 +4,7 @@ import numpy as np
 import os
 import importlib
 import argparse
+from backend_settings import avaliable_model_ids_sources
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model_id", type=str, help="model id")
@@ -15,7 +16,7 @@ parser.add_argument(
 parser.add_argument(
     "--source",
     type=str,
-    default="huggingface",
+    default=None,
     help="source of model, if not huggingface, will use local model in model_params.<source>",
 )
 parser.add_argument("--config_file", type=str, default=None, help="config file")
@@ -37,7 +38,11 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-analyzer = ModelAnalyzer(args.model_id, args.hardware, args.config_file,source=args.source)
+source = args.source
+if source is None:
+    source = avaliable_model_ids_sources.get(args.model_id, {}).get("source", "huggingface")
+
+analyzer = ModelAnalyzer(args.model_id, args.hardware, args.config_file,source=source)
 results = analyzer.analyze(
     batchsize=args.batchsize,
     seqlen=args.seqlen,

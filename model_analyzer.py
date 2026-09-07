@@ -196,6 +196,7 @@ class ModelAnalyzer:
         hidden_size = config.get_hidden_size(model_params)
         num_key_value_heads = config.get_num_key_value_heads(model_params)
         num_hidden_layers = config.get_num_hidden_layers(model_params)
+        moe_info = config.get_moe_info(model_params) if hasattr(config, "get_moe_info") else None
 
         for name, (ic, oc) in config.get_linear_layers(model_params, tp_size).items():
             # for linear layers
@@ -223,8 +224,67 @@ class ModelAnalyzer:
                 store_kv_cache=(0 if is_normal_proj else oc * batchsize * seqlen * kv_byte),
             )
 
+        # Simplified MoE FFN: compute/bandwidth use activated experts; footprint fixed later
+        if moe_info:
+            moe_hidden = moe_info["hidden_size"]
+            moe_inter = moe_info["moe_intermediate_size"]
+            n_routed = moe_info["n_routed_experts"]
+            n_shared = moe_info["n_shared_experts"]
+            topk = moe_info["num_experts_per_tok"]
+            n_active = topk + n_shared
+            # One expert = gate + up + down (SwiGLU)
+            expert_weight = (moe_hidden * moe_inter * 2 + moe_inter * moe_hidden) * w_byte
+            router_weight = moe_hidden * n_routed * w_byte
+            # OPs: 3 matmuls (2 flop each) + silu*mul on intermediate
+            expert_ops_per_token = n_active * (6 * moe_hidden * moe_inter + 2 * moe_inter)
+            router_ops_per_token = 2 * moe_hidden * n_routed
+
+            self._analyze_to_results(
+                "decode",
+                "router",
+                OPs=router_ops_per_token * batchsize,
+                load_weight=router_weight,
+                load_act=moe_hidden * batchsize * a_byte,
+                store_act=n_routed * batchsize * a_byte,
+                load_kv_cache=0,
+                store_kv_cache=0,
+            )
+            self._analyze_to_results(
+                "decode",
+                "experts",
+                OPs=expert_ops_per_token * batchsize,
+                load_weight=n_active * expert_weight,
+                load_act=moe_hidden * batchsize * a_byte,
+                store_act=moe_hidden * batchsize * a_byte,
+                load_kv_cache=0,
+                store_kv_cache=0,
+            )
+            self._analyze_to_results(
+                "prefill",
+                "router",
+                OPs=router_ops_per_token * batchsize * seqlen,
+                load_weight=router_weight,
+                load_act=moe_hidden * batchsize * seqlen * a_byte,
+                store_act=n_routed * batchsize * seqlen * a_byte,
+                load_kv_cache=0,
+                store_kv_cache=0,
+            )
+            self._analyze_to_results(
+                "prefill",
+                "experts",
+                OPs=expert_ops_per_token * batchsize * seqlen,
+                load_weight=n_active * expert_weight,
+                load_act=moe_hidden * batchsize * seqlen * a_byte,
+                store_act=moe_hidden * batchsize * seqlen * a_byte,
+                load_kv_cache=0,
+                store_kv_cache=0,
+            )
+
         # for attention
-        head_size = hidden_size // num_attention_heads
+        if hasattr(config, "get_head_size"):
+            head_size = config.get_head_size(model_params)
+        else:
+            head_size = hidden_size // num_attention_heads
         # for decode
         qk_matmul_OPs = seqlen * head_size * num_attention_heads * batchsize * 2
         sv_matmul_OPs = 1 * head_size * seqlen * num_attention_heads * batchsize * 2
@@ -315,17 +375,18 @@ class ModelAnalyzer:
                 load_kv_cache=0,
                 store_kv_cache=0,
             )
-        for name in ["mlp_act"]:
-            self._analyze_to_results(
-                "decode",
-                name,
-                OPs=batchsize * hidden_size * 1 * 2,
-                load_weight=0,
-                load_act=batchsize * hidden_size * 1 * a_byte * 2,
-                store_act=batchsize * hidden_size * 1 * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
+        if not moe_info:
+            for name in ["mlp_act"]:
+                self._analyze_to_results(
+                    "decode",
+                    name,
+                    OPs=batchsize * hidden_size * 1 * 2,
+                    load_weight=0,
+                    load_act=batchsize * hidden_size * 1 * a_byte * 2,
+                    store_act=batchsize * hidden_size * 1 * a_byte,
+                    load_kv_cache=0,
+                    store_kv_cache=0,
+                )
 
         # for prefill
         qk_matmul_OPs = seqlen * seqlen * head_size * num_attention_heads * batchsize * 2
@@ -405,17 +466,18 @@ class ModelAnalyzer:
                 load_kv_cache=0,
                 store_kv_cache=0,
             )
-        for name in ["mlp_act"]:
-            self._analyze_to_results(
-                "prefill",
-                name,
-                OPs=batchsize * hidden_size * seqlen * 1 * 2,
-                load_weight=0,
-                load_act=batchsize * hidden_size * seqlen * a_byte * 2,
-                store_act=batchsize * hidden_size * seqlen * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
+        if not moe_info:
+            for name in ["mlp_act"]:
+                self._analyze_to_results(
+                    "prefill",
+                    name,
+                    OPs=batchsize * hidden_size * seqlen * 1 * 2,
+                    load_weight=0,
+                    load_act=batchsize * hidden_size * seqlen * a_byte * 2,
+                    store_act=batchsize * hidden_size * seqlen * a_byte,
+                    load_kv_cache=0,
+                    store_kv_cache=0,
+                )
 
         # compute total
         total_results = {"decode": {}, "prefill": {}}
@@ -426,6 +488,21 @@ class ModelAnalyzer:
             for layer_name, result in self.results[stage].items():
                 for data_name in ALL_DATA_NAMES:
                     total_results[stage][data_name] += result[data_name] * num_hidden_layers
+
+        # MoE: roofline used activated experts; HBM footprint must count all experts
+        if moe_info:
+            moe_hidden = moe_info["hidden_size"]
+            moe_inter = moe_info["moe_intermediate_size"]
+            n_routed = moe_info["n_routed_experts"]
+            n_shared = moe_info["n_shared_experts"]
+            topk = moe_info["num_experts_per_tok"]
+            n_active = topk + n_shared
+            expert_weight = (moe_hidden * moe_inter * 2 + moe_inter * moe_hidden) * w_byte
+            full_experts_weight = (n_routed + n_shared) * expert_weight
+            active_experts_weight = n_active * expert_weight
+            delta = (full_experts_weight - active_experts_weight) * num_hidden_layers
+            total_results["prefill"]["load_weight"] += delta
+            total_results["decode"]["load_weight"] += delta
 
         # memory footprint
         weight_kv_footprint = total_results["prefill"]["load_weight"] + total_results["prefill"]["store_kv_cache"]
