@@ -25,6 +25,34 @@ hardware_params = {
     },  # use SXM data
     "nvidia_H100_SXM": {"bandwidth": 3072e9, "FP16": 1979e12 / 2, "INT8": 3958e12 / 2, "onchip_buffer": 33792e3},
     "nvidia_H100_PCIe": {"bandwidth": 2048e9, "FP16": 1513e12 / 2, "INT8": 3026e12 / 2, "onchip_buffer": 29184e3},
+    # https://www.nvidia.com/en-us/data-center/dgx-b200/
+    # Blackwell B200: ~160 SMs, RF ~256KB/SM; FP16/INT8 use dense = sparse/2 (same convention as H100)
+    "nvidia_B200": {
+        "bandwidth": 8000e9,
+        "FP16": 4500e12 / 2,
+        "INT8": 9000e12 / 2,
+        "onchip_buffer": 40960e3,
+    },
+    "nvidia_B200_SXM": {
+        "bandwidth": 8000e9,
+        "FP16": 4500e12 / 2,
+        "INT8": 9000e12 / 2,
+        "onchip_buffer": 40960e3,
+    },
+    # https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/
+    # Blackwell Ultra B300: same FP8/FP16 dense peak class as B200; higher HBM capacity (288GB), bandwidth still 8 TB/s
+    "nvidia_B300": {
+        "bandwidth": 8000e9,
+        "FP16": 4500e12 / 2,
+        "INT8": 9000e12 / 2,
+        "onchip_buffer": 40960e3,
+    },
+    "nvidia_B300_SXM": {
+        "bandwidth": 8000e9,
+        "FP16": 4500e12 / 2,
+        "INT8": 9000e12 / 2,
+        "onchip_buffer": 40960e3,
+    },
     # https://images.nvidia.com/aem-dam/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-v2.1.pdf
     # Ada SM has 256 KB Register File, and 128 KB of L1/Shared Memory
     "nvidia_L40": {"bandwidth": 864e9, "FP16": 181e12, "INT8": 362e12, "onchip_buffer": 36352e3},
