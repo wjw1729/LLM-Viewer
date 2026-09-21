@@ -40,16 +40,26 @@ parser.add_argument(
     "--attention-type",
     type=str,
     default=None,
-    choices=["full","sliding_window","swa"],
-    help="attention cost model: full (deafult) or sliding_window/swa",
-
+    choices=["full", "sliding_window", "swa", "csa", "hca"],
+    help="attention cost model: full / sliding_window|swa / csa / hca",
 )
 parser.add_argument(
     "--window-size",
     type=int,
     default=None,
-    help="sliding window size for SWA (implies --attention-type sliding_window if type omiited)",
-    
+    help="sliding window size for SWA (implies --attention-type sliding_window if type omitted)",
+)
+parser.add_argument(
+    "--compress-ratio",
+    type=int,
+    default=None,
+    help="KV compress ratio for CSA (default 4) / HCA (default 128)",
+)
+parser.add_argument(
+    "--index-topk",
+    type=int,
+    default=None,
+    help="CSA indexer top-k over compressed tokens (default 512)",
 )
 args = parser.parse_args()
 
@@ -68,5 +78,7 @@ results = analyzer.analyze(
     tp_size=args.tp_size,
     attention_type=args.attention_type,
     window_size=args.window_size,
+    compress_ratio=args.compress_ratio,
+    index_topk=args.index_topk,
 )
 analyzer.save_csv()

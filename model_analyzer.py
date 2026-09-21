@@ -55,23 +55,42 @@ class ModelAnalyzer:
         self.seqlen = None
         self.attention_type = None
         self.window_size = None
+        self.compress_ratio = None
+        self.index_topk = None
 
-    def _resolve_attention_type(self, attention_type=None,window_size=None):
-        cfg=self.config
-        if attention_type is None and hasattr(cfg,"get_attention_type"):
+    def _resolve_attention_type(
+        self,
+        attention_type=None,
+        window_size=None,
+        compress_ratio=None,
+        index_topk=None,
+    ):
+        cfg = self.config
+        if attention_type is None and hasattr(cfg, "get_attention_type"):
             attention_type = cfg.get_attention_type(self.model_params)
-        if window_size is None and hasattr(cfg,"get_sliding_window_size"):
+        if window_size is None and hasattr(cfg, "get_sliding_window_size"):
             window_size = cfg.get_sliding_window_size(self.model_params)
+        if compress_ratio is None and hasattr(cfg, "get_compress_ratio"):
+            compress_ratio = cfg.get_compress_ratio(self.model_params)
+        if index_topk is None and hasattr(cfg, "get_index_topk"):
+            index_topk = cfg.get_index_topk(self.model_params)
 
         if attention_type is None:
             if window_size is not None and window_size > 0:
                 attention_type = "sliding_window"
             else:
                 attention_type = "full"
-        
+
         self.attention_type = attention_type
         self.window_size = window_size
-        return create_attention_op(kind=attention_type, window_size=window_size)
+        self.compress_ratio = compress_ratio
+        self.index_topk = index_topk
+        return create_attention_op(
+            kind=attention_type,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            index_topk=index_topk,
+        )
 
     def _analyze_to_results(
         self,
@@ -150,6 +169,8 @@ class ModelAnalyzer:
         tp_size: int = 1,
         attention_type=None,
         window_size=None,
+        compress_ratio=None,
+        index_topk=None,
     ):
         """
         seqlen: sequence length
@@ -211,7 +232,12 @@ class ModelAnalyzer:
         self.seqlen = seqlen
         self.tp_size = tp_size
 
-        attn_op = self._resolve_attention_type(attention_type, window_size)
+        attn_op = self._resolve_attention_type(
+            attention_type,
+            window_size,
+            compress_ratio=compress_ratio,
+            index_topk=index_topk,
+        )
 
         w_byte = self.w_bit / 8
         a_byte = self.a_bit / 8
@@ -487,6 +513,8 @@ class ModelAnalyzer:
         tp_size: int = 1,
         attention_type=None,
         window_size=None,
+        compress_ratio=None,
+        index_topk=None,
     ):
         prefill_result = self.analyze(
             prompt_len,
@@ -498,6 +526,8 @@ class ModelAnalyzer:
             tp_size=tp_size,
             attention_type=attention_type,
             window_size=window_size,
+            compress_ratio=compress_ratio,
+            index_topk=index_topk,
         )
         prefill_time = inference_time = prefill_result["total_results"]["prefill"]["inference_time"]
 
@@ -512,6 +542,8 @@ class ModelAnalyzer:
                 tp_size=tp_size,
                 attention_type=attention_type,
                 window_size=window_size,
+                compress_ratio=compress_ratio,
+                index_topk=index_topk,
             )
             inference_time += result["total_results"]["decode"]["inference_time"]
         return {"inference_time": inference_time, "prefill_time": prefill_time}

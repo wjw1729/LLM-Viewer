@@ -60,6 +60,12 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
     window_size= inference_config.get("window_size")
     if window_size is not None:
         window_size = int(window_size)
+    compress_ratio = inference_config.get("compress_ratio")
+    if compress_ratio is not None:
+        compress_ratio = int(compress_ratio)
+    index_topk = inference_config.get("index_topk")
+    if index_topk is not None:
+        index_topk = int(index_topk)
 
     analyzer = get_analyer(model_id, hardware, config_path)
     result = analyzer.analyze(
@@ -72,6 +78,8 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
         tp_size=tp_size,
         attention_type=attention_type,
         window_size=window_size,
+        compress_ratio=compress_ratio,
+        index_topk=index_topk,
     )
     bandwidth, max_OPS, onchip_buffer = analyzer.get_hardware_info()
     GQA = analyzer.get_model_info()["GQA"]
