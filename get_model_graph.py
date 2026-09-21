@@ -66,6 +66,10 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
     index_topk = inference_config.get("index_topk")
     if index_topk is not None:
         index_topk = int(index_topk)
+    vision_tokens = inference_config.get("vision_tokens")
+    if vision_tokens is not None:
+        vision_tokens = int(vision_tokens)
+    num_images = int(inference_config.get("num_images", 1) or 1)
 
     analyzer = get_analyer(model_id, hardware, config_path)
     result = analyzer.analyze(
@@ -80,6 +84,8 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
         window_size=window_size,
         compress_ratio=compress_ratio,
         index_topk=index_topk,
+        vision_tokens=vision_tokens,
+        num_images=num_images,
     )
     bandwidth, max_OPS, onchip_buffer = analyzer.get_hardware_info()
     GQA = analyzer.get_model_info()["GQA"]

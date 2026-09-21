@@ -1,7 +1,6 @@
 from easydict import EasyDict
 
 # Values from https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/raw/main/config.json
-# Phase 1 uses text/MoE fields only; vision_* kept for later phases.
 
 _deepseek_v4_flash_vision_exp = EasyDict(
     architectures=["DeepseekV4ForCausalLM"],
@@ -21,11 +20,17 @@ _deepseek_v4_flash_vision_exp = EasyDict(
     num_experts_per_tok=6,
     moe_intermediate_size=2048,
     num_hash_layers=3,  # first 3 layers: hash MoE; rest: learned gate
-    # Vision (unused in Phase 1)
+    # Vision encoder (DeepSeek-ViT + Aligner)
     vision_n_layers=32,
     vision_dim=1024,
     vision_n_heads=16,
     vision_inter_dim=2816,
+    vision_patch_size=14,
+    vision_rope_theta=10000.0,
+    vision_downsample_ratio=3,
+    vision_max_n_token=384,
+    vision_min_pixels=147456,
+    vision_max_wh_ratio=8,
 )
 
 model_params = {

@@ -109,7 +109,11 @@ class ModelAnalyzer:
         bandwidth, max_OPS, onchip_buffer = self.get_hardware_info()
         memory_access = load_weight + load_act + store_act + load_kv_cache + store_kv_cache
         arithmetic_intensity, performance, bound = roofline_analyze(bandwidth, max_OPS, OPs, memory_access)
-        inference_time = OPs / performance
+        # Pure memory moves (OPs==0) are timed as memory_access / bandwidth.
+        if performance == 0:
+            inference_time = (memory_access / bandwidth) if bandwidth > 0 else 0.0
+        else:
+            inference_time = OPs / performance
         self.results[stage][name] = {
             "OPs": OPs,
             "memory_access": memory_access,
@@ -285,6 +289,8 @@ class ModelAnalyzer:
         window_size=None,
         compress_ratio=None,
         index_topk=None,
+        vision_tokens=None,
+        num_images=1,
     ):
         """
         seqlen: sequence length
@@ -295,6 +301,8 @@ class ModelAnalyzer:
         use_flashattention: use flash attention/flash decoding
         kv_token_ratio: use this for KV compression
         tp_size: the number of devices for tensor parallelism to use
+        vision_tokens: LLM-side vision tokens after aligner (0/None disables encoder)
+        num_images: number of images in the prompt (prefill only)
 
         return is a dict with the following format:
         {
@@ -345,6 +353,16 @@ class ModelAnalyzer:
         self.batchsize = batchsize
         self.seqlen = seqlen
         self.tp_size = tp_size
+
+        # Default: if model has a vision encoder and caller didn't set tokens, use max
+        if vision_tokens is None and hasattr(self.config, "get_vision_info"):
+            vinfo = self.config.get_vision_info(self.model_params)
+            if vinfo is not None:
+                vision_tokens = vinfo.get("vision_max_n_token", 0)
+        if vision_tokens is None:
+            vision_tokens = 0
+        self.vision_tokens = int(vision_tokens)
+        self.num_images = max(1, int(num_images or 1))
 
         attn_op = self._resolve_attention_type(
             attention_type,
@@ -591,6 +609,22 @@ class ModelAnalyzer:
         total_results["prefill"]["memory_consumption_weight"] = total_results["prefill"]["load_weight"]
         total_results["prefill"]["memory_consumption_kv_cache"] = kv_footprint
 
+        # vision encoder / aligner (prefill only; not multiplied by LLM depth)
+        if hasattr(self.config, "pre_process"):
+            pre_args = {
+                "batchsize": batchsize,
+                "a_byte": a_byte,
+                "w_byte": w_byte,
+                "vision_tokens": vision_tokens,
+                "num_images": num_images,
+            }
+            for layer_info in self.config.pre_process(self.model_params, pre_args):
+                self._analyze_to_results(**layer_info)
+                for data_name in ALL_DATA_NAMES:
+                    total_results[layer_info["stage"]][data_name] += self.results[
+                        layer_info["stage"]
+                    ][layer_info["name"]][data_name]
+
         # lm_head
         name = "lm_head"
         args = {"batchsize": batchsize, "a_byte": a_byte, "w_byte": w_byte}
@@ -645,6 +679,8 @@ class ModelAnalyzer:
         window_size=None,
         compress_ratio=None,
         index_topk=None,
+        vision_tokens=None,
+        num_images=1,
     ):
         prefill_result = self.analyze(
             prompt_len,
@@ -658,6 +694,8 @@ class ModelAnalyzer:
             window_size=window_size,
             compress_ratio=compress_ratio,
             index_topk=index_topk,
+            vision_tokens=vision_tokens,
+            num_images=num_images,
         )
         prefill_time = inference_time = prefill_result["total_results"]["prefill"]["inference_time"]
 
@@ -674,6 +712,8 @@ class ModelAnalyzer:
                 window_size=window_size,
                 compress_ratio=compress_ratio,
                 index_topk=index_topk,
+                vision_tokens=0,  # vision encoder only on first prefill
+                num_images=num_images,
             )
             inference_time += result["total_results"]["decode"]["inference_time"]
         return {"inference_time": inference_time, "prefill_time": prefill_time}

@@ -10,6 +10,17 @@ from typing import Dict, Iterable, Mapping, Optional
 
 # category -> name matchers (substring / exact). First match wins.
 _CATEGORY_RULES = [
+    (
+        "vision",
+        (
+            "vision_patch_embed",
+            "vision_attn",
+            "vision_mlp",
+            "vision_norm",
+            "vision_downsample",
+            "vision_aligner",
+        ),
+    ),
     ("moe", ("hash_router", "hash_experts", "router", "experts")),
     (
         "attention",
@@ -60,7 +71,7 @@ def layer_multiplier(
     num_learned_layers: Optional[int] = None,
 ) -> int:
     """Match ModelAnalyzer total aggregation weights."""
-    if layer_name == "lm_head":
+    if layer_name == "lm_head" or layer_name.startswith("vision_"):
         return 1
     if num_learned_layers is None:
         num_learned_layers = max(0, num_hidden_layers - num_hash_layers)
@@ -128,7 +139,17 @@ def aggregate_e2e(
 
     # stable category order
     ordered = {}
-    preferred = ["attn_proj", "attention", "moe", "mlp", "norm", "residual", "head", "other"]
+    preferred = [
+        "vision",
+        "attn_proj",
+        "attention",
+        "moe",
+        "mlp",
+        "norm",
+        "residual",
+        "head",
+        "other",
+    ]
     for cat in preferred:
         if cat in categories:
             ordered[cat] = categories[cat]

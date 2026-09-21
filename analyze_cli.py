@@ -61,6 +61,18 @@ parser.add_argument(
     default=None,
     help="CSA indexer top-k over compressed tokens (default 512)",
 )
+parser.add_argument(
+    "--vision-tokens",
+    type=int,
+    default=None,
+    help="LLM-side vision tokens after aligner (default: vision_max_n_token if model has ViT; 0 disables)",
+)
+parser.add_argument(
+    "--num-images",
+    type=int,
+    default=1,
+    help="number of images in the prompt (vision prefill only)",
+)
 args = parser.parse_args()
 
 source = args.source
@@ -80,5 +92,7 @@ results = analyzer.analyze(
     window_size=args.window_size,
     compress_ratio=args.compress_ratio,
     index_topk=args.index_topk,
+    vision_tokens=args.vision_tokens,
+    num_images=args.num_images,
 )
 analyzer.save_csv()

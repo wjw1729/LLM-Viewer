@@ -1,9 +1,12 @@
-"""DeepSeek-V4 (Flash / Vision-Exp) — text backbone + MoE (hash + learned).
+"""DeepSeek-V4 (Flash / Vision-Exp) — text backbone + MoE + optional ViT encoder.
 
 Attention uses a LoRA-style Q/O approximation + MQA KV.
 FFN: first num_hash_layers use hash MoE; remaining layers use learned-gate MoE.
-Not modeled yet: CSA/HCA hybrid per-layer schedule, Hyper-Connections, Vision, MTP/DSpark.
+Vision-Exp adds DeepSeek-ViT + Aligner on the prefill path only.
+Not modeled yet: CSA/HCA hybrid per-layer schedule, Hyper-Connections, MTP/DSpark.
 """
+
+from ops.vision import VisionDims, create_vision_op, vision_token_geometry
 
 
 def get_num_attention_heads(model_params):
@@ -61,6 +64,60 @@ def get_moe_info(model_params):
         "num_hash_layers": num_hash_layers,
         "num_learned_layers": num_layers - num_hash_layers,
     }
+
+
+def get_vision_info(model_params):
+    """Vision encoder params; None if text-only checkpoint."""
+    n_layers = int(getattr(model_params, "vision_n_layers", 0) or 0)
+    if n_layers <= 0:
+        return None
+    return {
+        "vision_n_layers": n_layers,
+        "vision_dim": int(getattr(model_params, "vision_dim")),
+        "vision_n_heads": int(getattr(model_params, "vision_n_heads")),
+        "vision_inter_dim": int(getattr(model_params, "vision_inter_dim")),
+        "vision_patch_size": int(getattr(model_params, "vision_patch_size", 14)),
+        "vision_downsample_ratio": int(getattr(model_params, "vision_downsample_ratio", 3)),
+        "vision_max_n_token": int(getattr(model_params, "vision_max_n_token", 384)),
+        "llm_hidden_size": int(get_hidden_size(model_params)),
+        "kind": "deepseek_vit",
+    }
+
+
+def pre_process(model_params, args):
+    """Vision encoder + aligner (prefill only). Returns analyzer layer dicts."""
+    vision = get_vision_info(model_params)
+    if vision is None:
+        return []
+
+    n_out = int(args.get("vision_tokens", 0) or 0)
+    if n_out <= 0:
+        return []
+
+    num_images = max(1, int(args.get("num_images", 1) or 1))
+    n_out = min(n_out, vision["vision_max_n_token"])
+    n_vit, n_out = vision_token_geometry(n_out, vision["vision_downsample_ratio"])
+
+    dims = VisionDims(
+        batchsize=int(args["batchsize"]),
+        num_images=num_images,
+        n_vit_tokens=n_vit,
+        n_out_tokens=n_out,
+        vision_dim=vision["vision_dim"],
+        vision_n_heads=vision["vision_n_heads"],
+        vision_inter_dim=vision["vision_inter_dim"],
+        vision_n_layers=vision["vision_n_layers"],
+        vision_patch_size=vision["vision_patch_size"],
+        downsample_ratio=vision["vision_downsample_ratio"],
+        llm_hidden_size=vision["llm_hidden_size"],
+        w_byte=float(args["w_byte"]),
+        a_byte=float(args["a_byte"]),
+    )
+    op = create_vision_op(vision.get("kind", "deepseek_vit"))
+    layers = []
+    for cost in op.prefill_costs(dims):
+        layers.append(cost.as_kwargs("prefill"))
+    return layers
 
 
 def post_process(model_params, args):
