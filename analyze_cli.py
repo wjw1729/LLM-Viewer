@@ -36,6 +36,21 @@ parser.add_argument(
     default=1,
     help="the number of devices for tensor parallelism to use"
 )
+parser.add_argument(
+    "--attention-type",
+    type=str,
+    default=None,
+    choices=["full","sliding_window","swa"],
+    help="attention cost model: full (deafult) or sliding_window/swa",
+
+)
+parser.add_argument(
+    "--window-size",
+    type=int,
+    default=None,
+    help="sliding window size for SWA (implies --attention-type sliding_window if type omiited)",
+    
+)
 args = parser.parse_args()
 
 source = args.source
@@ -50,6 +65,8 @@ results = analyzer.analyze(
     a_bit=args.a_bit,
     kv_bit=args.kv_bit,
     use_flashattention=args.use_flashattention,
-    tp_size=args.tp_size
+    tp_size=args.tp_size,
+    attention_type=args.attention_type,
+    window_size=args.window_size,
 )
 analyzer.save_csv()

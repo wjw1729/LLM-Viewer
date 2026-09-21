@@ -56,6 +56,10 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
     use_flashattention = bool(inference_config["use_flashattention"])
     gen_length = int(inference_config["gen_length"])
     tp_size = int(inference_config["tp_size"])
+    attention_type = inference_config.get("attention_type")
+    window_size= inference_config.get("window_size")
+    if window_size is not None:
+        window_size = int(window_size)
 
     analyzer = get_analyer(model_id, hardware, config_path)
     result = analyzer.analyze(
@@ -65,7 +69,9 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
         a_bit=a_bit,
         kv_bit=kv_bit,
         use_flashattention=use_flashattention,
-        tp_size=tp_size
+        tp_size=tp_size,
+        attention_type=attention_type,
+        window_size=window_size,
     )
     bandwidth, max_OPS, onchip_buffer = analyzer.get_hardware_info()
     GQA = analyzer.get_model_info()["GQA"]

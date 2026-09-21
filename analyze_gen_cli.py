@@ -1,9 +1,9 @@
 from model_analyzer import ModelAnalyzer
-import torch.nn as nn
 import numpy as np
 import os
 import importlib
 import argparse
+from backend_settings import avaliable_model_ids_sources
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model_id", type=str, help="model id")
@@ -11,6 +11,12 @@ parser.add_argument(
     "hardware",
     type=str,
     help="name of hardware, for example nvidia_V100 or nvidia_A6000",
+)
+parser.add_argument(
+    "--source",
+    type=str,
+    default=None,
+    help="source of model, if not huggingface, will use local model in model_params.<source>",
 )
 parser.add_argument("--config_file", type=str, default=None, help="config file")
 parser.add_argument("--batchsize", type=int, default=1, help="batch size")
@@ -24,11 +30,28 @@ parser.add_argument(
     "--tp-size",
     type=int,
     default=1,
-    help="the number of devices for tensor parallelism to use"
+    help="the number of devices for tensor parallelism to use",
+)
+parser.add_argument(
+    "--attention-type",
+    type=str,
+    default=None,
+    choices=["full", "sliding_window", "swa"],
+    help="attention cost model: full (default) or sliding_window/swa",
+)
+parser.add_argument(
+    "--window-size",
+    type=int,
+    default=None,
+    help="sliding window size for SWA (implies --attention-type sliding_window if type omitted)",
 )
 args = parser.parse_args()
 
-analyzer=ModelAnalyzer(args.model_id,args.hardware,args.config_file)
+source = args.source
+if source is None:
+    source = avaliable_model_ids_sources.get(args.model_id, {}).get("source", "huggingface")
+
+analyzer = ModelAnalyzer(args.model_id, args.hardware, args.config_file, source=source)
 ret = analyzer.analyze_generate_task(
     args.promptlen,
     args.seqlen,
@@ -37,8 +60,14 @@ ret = analyzer.analyze_generate_task(
     args.a_bit,
     args.kv_bit,
     args.use_flashattention,
-    tp_size=args.tp_size
+    tp_size=args.tp_size,
+    attention_type=args.attention_type,
+    window_size=args.window_size,
 )
 elapse = ret["inference_time"]
 prefill_elapse = ret["prefill_time"]
-print(f"{args.hardware}: 1st token latency {prefill_elapse:.2f}, total latency {elapse:.2f}, throughput {args.seqlen * args.batchsize / elapse:.2f} Token/sec")
+print(
+    f"{args.hardware}: 1st token latency {prefill_elapse:.2f}, "
+    f"total latency {elapse:.2f}, "
+    f"throughput {args.seqlen * args.batchsize / elapse:.2f} Token/sec"
+)
