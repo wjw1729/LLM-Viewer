@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from utils import str_number, str_number_time
 import math
 from ops.attention import AttnDims, create_attention_op
+from ops.moe import MoeDims, create_moe_op
 
 ALL_DATA_NAMES = [
     "OPs",
@@ -277,61 +278,42 @@ class ModelAnalyzer:
                 store_kv_cache=(0 if is_normal_proj else oc * batchsize * seqlen * kv_byte),
             )
 
-        # Simplified MoE FFN: compute/bandwidth use activated experts; footprint fixed later
+        # MoE FFN: hash-gate layers + learned-gate layers (DeepSeek-V4 style)
         if moe_info:
-            moe_hidden = moe_info["hidden_size"]
-            moe_inter = moe_info["moe_intermediate_size"]
-            n_routed = moe_info["n_routed_experts"]
-            n_shared = moe_info["n_shared_experts"]
-            topk = moe_info["num_experts_per_tok"]
-            n_active = topk + n_shared
-            # One expert = gate + up + down (SwiGLU)
-            expert_weight = (moe_hidden * moe_inter * 2 + moe_inter * moe_hidden) * w_byte
-            router_weight = moe_hidden * n_routed * w_byte
-            # OPs: 3 matmuls (2 flop each) + silu*mul on intermediate
-            expert_ops_per_token = n_active * (6 * moe_hidden * moe_inter + 2 * moe_inter)
-            router_ops_per_token = 2 * moe_hidden * n_routed
+            moe_dims = MoeDims(
+                batchsize=batchsize,
+                seqlen=seqlen,
+                hidden_size=moe_info["hidden_size"],
+                moe_intermediate_size=moe_info["moe_intermediate_size"],
+                n_routed_experts=moe_info["n_routed_experts"],
+                n_shared_experts=moe_info["n_shared_experts"],
+                num_experts_per_tok=moe_info["num_experts_per_tok"],
+                w_byte=w_byte,
+                a_byte=a_byte,
+            )
+            n_hash = int(moe_info.get("num_hash_layers", 0) or 0)
+            n_learned = int(
+                moe_info.get("num_learned_layers", num_hidden_layers - n_hash)
+            )
+            # Clamp in case config is inconsistent
+            n_hash = max(0, min(n_hash, num_hidden_layers))
+            n_learned = num_hidden_layers - n_hash
+            moe_info = dict(moe_info)
+            moe_info["num_hash_layers"] = n_hash
+            moe_info["num_learned_layers"] = n_learned
 
-            self._analyze_to_results(
-                "decode",
-                "router",
-                OPs=router_ops_per_token * batchsize,
-                load_weight=router_weight,
-                load_act=moe_hidden * batchsize * a_byte,
-                store_act=n_routed * batchsize * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
-            self._analyze_to_results(
-                "decode",
-                "experts",
-                OPs=expert_ops_per_token * batchsize,
-                load_weight=n_active * expert_weight,
-                load_act=moe_hidden * batchsize * a_byte,
-                store_act=moe_hidden * batchsize * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
-            self._analyze_to_results(
-                "prefill",
-                "router",
-                OPs=router_ops_per_token * batchsize * seqlen,
-                load_weight=router_weight,
-                load_act=moe_hidden * batchsize * seqlen * a_byte,
-                store_act=n_routed * batchsize * seqlen * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
-            self._analyze_to_results(
-                "prefill",
-                "experts",
-                OPs=expert_ops_per_token * batchsize * seqlen,
-                load_weight=n_active * expert_weight,
-                load_act=moe_hidden * batchsize * seqlen * a_byte,
-                store_act=moe_hidden * batchsize * seqlen * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
+            if n_hash > 0:
+                hash_moe = create_moe_op("hash")
+                for layer_cost in hash_moe.decode_costs(moe_dims):
+                    self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+                for layer_cost in hash_moe.prefill_costs(moe_dims):
+                    self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+            if n_learned > 0:
+                learned_moe = create_moe_op("learned")
+                for layer_cost in learned_moe.decode_costs(moe_dims):
+                    self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+                for layer_cost in learned_moe.prefill_costs(moe_dims):
+                    self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
 
         # for attention
         if hasattr(config, "get_head_size"):
@@ -432,22 +414,43 @@ class ModelAnalyzer:
         for data_name in ALL_DATA_NAMES:
             total_results["decode"][data_name] = 0
             total_results["prefill"][data_name] = 0
+
+        # MoE layer counts for weighted aggregation (hash vs learned)
+        n_hash = 0
+        n_learned = 0
+        if moe_info:
+            n_hash = int(moe_info.get("num_hash_layers", 0) or 0)
+            n_learned = int(moe_info.get("num_learned_layers", num_hidden_layers - n_hash))
+
+        def _moe_layer_multiplier(layer_name: str) -> int:
+            if layer_name in ("hash_router", "hash_experts"):
+                return n_hash
+            if layer_name in ("router", "experts"):
+                return n_learned
+            return num_hidden_layers
+
         for stage in ["decode", "prefill"]:
             for layer_name, result in self.results[stage].items():
+                mult = _moe_layer_multiplier(layer_name)
                 for data_name in ALL_DATA_NAMES:
-                    total_results[stage][data_name] += result[data_name] * num_hidden_layers
+                    total_results[stage][data_name] += result[data_name] * mult
 
         # MoE: roofline used activated experts; HBM footprint must count all experts
         if moe_info:
-            moe_hidden = moe_info["hidden_size"]
-            moe_inter = moe_info["moe_intermediate_size"]
-            n_routed = moe_info["n_routed_experts"]
-            n_shared = moe_info["n_shared_experts"]
-            topk = moe_info["num_experts_per_tok"]
-            n_active = topk + n_shared
-            expert_weight = (moe_hidden * moe_inter * 2 + moe_inter * moe_hidden) * w_byte
-            full_experts_weight = (n_routed + n_shared) * expert_weight
-            active_experts_weight = n_active * expert_weight
+            moe_dims = MoeDims(
+                batchsize=batchsize,
+                seqlen=seqlen,
+                hidden_size=moe_info["hidden_size"],
+                moe_intermediate_size=moe_info["moe_intermediate_size"],
+                n_routed_experts=moe_info["n_routed_experts"],
+                n_shared_experts=moe_info["n_shared_experts"],
+                num_experts_per_tok=moe_info["num_experts_per_tok"],
+                w_byte=w_byte,
+                a_byte=a_byte,
+            )
+            moe_ref = create_moe_op("learned")
+            full_experts_weight = moe_ref.full_experts_weight_bytes(moe_dims)
+            active_experts_weight = moe_ref.active_experts_weight_bytes(moe_dims)
             delta = (full_experts_weight - active_experts_weight) * num_hidden_layers
             total_results["prefill"]["load_weight"] += delta
             total_results["decode"]["load_weight"] += delta

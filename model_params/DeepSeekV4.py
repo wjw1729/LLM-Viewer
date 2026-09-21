@@ -20,6 +20,7 @@ _deepseek_v4_flash_vision_exp = EasyDict(
     n_shared_experts=1,
     num_experts_per_tok=6,
     moe_intermediate_size=2048,
+    num_hash_layers=3,  # first 3 layers: hash MoE; rest: learned gate
     # Vision (unused in Phase 1)
     vision_n_layers=32,
     vision_dim=1024,

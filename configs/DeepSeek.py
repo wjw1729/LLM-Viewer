@@ -1,7 +1,8 @@
-"""DeepSeek-V4 (Flash / Vision-Exp) — Phase 1: text backbone + simplified MoE.
+"""DeepSeek-V4 (Flash / Vision-Exp) — text backbone + MoE (hash + learned).
 
-Not modeled yet: CSA/HCA hybrid attention, Hyper-Connections, Vision encoder, MTP/DSpark.
-Attention uses a LoRA-style Q/O approximation + MQA KV; FFN is MoE (top-k routed + shared).
+Attention uses a LoRA-style Q/O approximation + MQA KV.
+FFN: first num_hash_layers use hash MoE; remaining layers use learned-gate MoE.
+Not modeled yet: CSA/HCA hybrid per-layer schedule, Hyper-Connections, Vision, MTP/DSpark.
 """
 
 
@@ -40,16 +41,25 @@ def get_vocab_size(model_params):
 
 
 def get_moe_info(model_params):
-    """Return MoE routing params, or None if not an MoE model."""
+    """Return MoE routing params, or None if not an MoE model.
+
+    DeepSeek-V4: first `num_hash_layers` use hash-table gates; the rest use
+    a learned dense gate (top-k + shared expert).
+    """
     n_routed = getattr(model_params, "n_routed_experts", None)
     if not n_routed:
         return None
+    num_layers = int(get_num_hidden_layers(model_params))
+    num_hash_layers = int(getattr(model_params, "num_hash_layers", 0) or 0)
+    num_hash_layers = max(0, min(num_hash_layers, num_layers))
     return {
         "n_routed_experts": int(n_routed),
         "n_shared_experts": int(getattr(model_params, "n_shared_experts", 1)),
         "num_experts_per_tok": int(getattr(model_params, "num_experts_per_tok", 1)),
         "moe_intermediate_size": int(getattr(model_params, "moe_intermediate_size")),
         "hidden_size": int(get_hidden_size(model_params)),
+        "num_hash_layers": num_hash_layers,
+        "num_learned_layers": num_layers - num_hash_layers,
     }
 
 
