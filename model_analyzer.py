@@ -7,6 +7,7 @@ from utils import str_number, str_number_time
 import math
 from ops.attention import AttnDims, create_attention_op
 from ops.moe import MoeDims, create_moe_op
+from report import aggregate_e2e
 
 ALL_DATA_NAMES = [
     "OPs",
@@ -134,29 +135,141 @@ class ModelAnalyzer:
         prefill_file_name = f"{save_path}_prefill.csv"
         print(f"save to {decode_file_name} and {prefill_file_name}")
 
+        num_hidden_layers = self.config.get_num_hidden_layers(self.model_params)
+        moe_info = (
+            self.config.get_moe_info(self.model_params)
+            if hasattr(self.config, "get_moe_info")
+            else None
+        )
+        n_hash = int((moe_info or {}).get("num_hash_layers", 0) or 0)
+        n_learned = int(
+            (moe_info or {}).get("num_learned_layers", num_hidden_layers - n_hash)
+        )
+
+        attn_meta = f"attn={self.attention_type}"
+        if self.window_size:
+            attn_meta += f",window={self.window_size}"
+        if self.compress_ratio:
+            attn_meta += f",compress_ratio={self.compress_ratio}"
+        if self.index_topk:
+            attn_meta += f",index_topk={self.index_topk}"
+
         for file_name, stage in [
             (decode_file_name, "decode"),
             (prefill_file_name, "prefill"),
         ]:
-            with open(file_name, "a+") as f:
+            stage_label = "decode_step" if stage == "decode" else "prefill"
+            report = aggregate_e2e(
+                self.results[stage],
+                num_hidden_layers=num_hidden_layers,
+                num_hash_layers=n_hash,
+                num_learned_layers=n_learned,
+            )
+            total = self.results.get("total_results", {}).get(stage, {})
+            e2e_time = report["e2e"]["inference_time"]
+            # Prefer analyzer total_results when present (includes footprint fields)
+            if total.get("inference_time") is not None:
+                # category sum should match; keep report e2e for category consistency
+                pass
 
-                attn_meta = f"attn={self.attention_type}"
-                if self.window_size:
-                    attn_meta += f"window_size={self.window_size}"
-                f.write(
-                    f"\n\n=== {self.model_id} {self.hardware} w_bit={self.w_bit} a_bit={self.a_bit} kv_bit={self.kv_bit} batchsize={self.batchsize} seqlen={self.seqlen} tp_size={self.tp_size} ===\n"
-                )
-                # legend
-                f.write(
-                    f"layer_name,OPs,Access,arithmetic_intensity,performance,bound,load_weight,load_act,store_act,load_kv_cache,store_kv_cache,inference_time\n"
-                )
             with open(file_name, "a+") as f:
+                f.write(
+                    f"\n\n=== {self.model_id} {self.hardware} w_bit={self.w_bit} "
+                    f"a_bit={self.a_bit} kv_bit={self.kv_bit} batchsize={self.batchsize} "
+                    f"seqlen={self.seqlen} tp_size={self.tp_size} {attn_meta} ===\n"
+                )
+                f.write(
+                    "# Per-block ops (one transformer block; MoE shows both hash & learned routers)\n"
+                )
+                f.write(
+                    "layer_name,OPs,Access,arithmetic_intensity,performance,bound,"
+                    "load_weight,load_act,store_act,load_kv_cache,store_kv_cache,inference_time\n"
+                )
                 for layer_name, result in self.results[stage].items():
                     f.write(
-                        f"{layer_name},{str_number(result['OPs'])},{str_number(result['memory_access'])}B,{str_number(result['arithmetic_intensity'])},{str_number(result['performance'])},"
-                        f"{result['bound']},{str_number(result['load_weight'])}B,{str_number(result['load_act'])}B,{str_number(result['store_act'])}B,{str_number(result['load_kv_cache'])}B,"
-                        f"{str_number(result['store_kv_cache'])}B,{str_number_time(result['inference_time'])}s\n"
+                        f"{layer_name},{str_number(result['OPs'])},"
+                        f"{str_number(result['memory_access'])}B,"
+                        f"{str_number(result['arithmetic_intensity'])},"
+                        f"{str_number(result['performance'])},"
+                        f"{result['bound']},"
+                        f"{str_number(result['load_weight'])}B,"
+                        f"{str_number(result['load_act'])}B,"
+                        f"{str_number(result['store_act'])}B,"
+                        f"{str_number(result['load_kv_cache'])}B,"
+                        f"{str_number(result['store_kv_cache'])}B,"
+                        f"{str_number_time(result['inference_time'])}s\n"
                     )
+
+                # --- E2E summary ---
+                f.write(f"\n=== E2E Summary ({stage_label}) ===\n")
+                f.write("metric,value\n")
+                f.write(f"e2e_inference_time_s,{e2e_time}\n")
+                f.write(f"e2e_inference_time,{str_number_time(e2e_time)}s\n")
+                f.write(f"e2e_OPs,{report['e2e']['OPs']}\n")
+                f.write(f"e2e_OPs_str,{str_number(report['e2e']['OPs'])}\n")
+                f.write(f"e2e_memory_access_B,{report['e2e']['memory_access']}\n")
+                f.write(
+                    f"e2e_memory_access,{str_number(report['e2e']['memory_access'])}B\n"
+                )
+                if total:
+                    if "memory_consumption" in total:
+                        f.write(
+                            f"memory_consumption_B,{total['memory_consumption']}\n"
+                        )
+                        f.write(
+                            f"memory_consumption,{str_number(total['memory_consumption'])}B\n"
+                        )
+                    if "memory_consumption_weight" in total:
+                        f.write(
+                            f"memory_consumption_weight_B,{total['memory_consumption_weight']}\n"
+                        )
+                    if "memory_consumption_kv_cache" in total:
+                        f.write(
+                            f"memory_consumption_kv_cache_B,{total['memory_consumption_kv_cache']}\n"
+                        )
+                f.write(f"num_hidden_layers,{num_hidden_layers}\n")
+                if moe_info:
+                    f.write(f"num_hash_layers,{n_hash}\n")
+                    f.write(f"num_learned_layers,{n_learned}\n")
+
+                # --- category breakdown ---
+                f.write(f"\n=== Category Breakdown ({stage_label}) ===\n")
+                f.write(
+                    "category,inference_time_s,time_pct,OPs,ops_pct,memory_access_B,access_pct\n"
+                )
+                for cat, vals in report["categories"].items():
+                    f.write(
+                        f"{cat},{vals['inference_time']},{vals['inference_time_pct']:.2f},"
+                        f"{vals['OPs']},{vals['OPs_pct']:.2f},"
+                        f"{vals['memory_access']},{vals['memory_access_pct']:.2f}\n"
+                    )
+
+                # --- scaled ops (network-wise) ---
+                f.write(f"\n=== E2E Scaled Ops ({stage_label}) ===\n")
+                f.write(
+                    "layer_name,category,mult,inference_time_s,time_pct,OPs,ops_pct\n"
+                )
+                # sort by time desc
+                scaled_items = sorted(
+                    report["scaled_layers"].items(),
+                    key=lambda kv: kv[1]["inference_time"],
+                    reverse=True,
+                )
+                for layer_name, entry in scaled_items:
+                    f.write(
+                        f"{layer_name},{entry['category']},{entry['mult']},"
+                        f"{entry['inference_time']},{entry['inference_time_pct']:.2f},"
+                        f"{entry['OPs']},{entry['OPs_pct']:.2f}\n"
+                    )
+
+            # console brief
+            print(
+                f"[{stage_label}] e2e={str_number_time(e2e_time)}s  "
+                + " | ".join(
+                    f"{c}={v['inference_time_pct']:.1f}%"
+                    for c, v in report["categories"].items()
+                )
+            )
 
     def analyze(
         self,
@@ -502,6 +615,20 @@ class ModelAnalyzer:
         #         total_results[stage][data_name] += self.results[stage][name][data_name]
 
         self.results["total_results"] = total_results
+        self.results["e2e_report"] = {
+            "decode": aggregate_e2e(
+                self.results["decode"],
+                num_hidden_layers=num_hidden_layers,
+                num_hash_layers=n_hash,
+                num_learned_layers=n_learned,
+            ),
+            "prefill": aggregate_e2e(
+                self.results["prefill"],
+                num_hidden_layers=num_hidden_layers,
+                num_hash_layers=n_hash,
+                num_learned_layers=n_learned,
+            ),
+        }
         return self.results
 
     def analyze_generate_task(
