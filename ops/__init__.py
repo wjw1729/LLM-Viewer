@@ -1,4 +1,4 @@
-"""Pluggable operator cost models (attention, MoE, ...)."""
+"""Pluggable operator cost models (attention, MoE, vision, HC, ...)."""
 
 from ops.attention import create_attention_op
 from ops.moe import create_moe_op

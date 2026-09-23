@@ -3,9 +3,11 @@
 Attention uses a LoRA-style Q/O approximation + MQA KV.
 FFN: first num_hash_layers use hash MoE; remaining layers use learned-gate MoE.
 Vision-Exp adds DeepSeek-ViT + Aligner on the prefill path only.
-Not modeled yet: CSA/HCA hybrid per-layer schedule, Hyper-Connections, MTP/DSpark.
+Residual path uses Manifold-Constrained Hyper-Connections (mHC).
+Not modeled yet: CSA/HCA hybrid per-layer schedule, MTP/DSpark.
 """
 
+from ops.hc import HcDims, embedding_cost, hc_head_cost
 from ops.vision import VisionDims, create_vision_op, vision_token_geometry
 
 
@@ -66,6 +68,18 @@ def get_moe_info(model_params):
     }
 
 
+def get_hc_info(model_params):
+    """mHC params; None if Hyper-Connections are disabled."""
+    hc_mult = int(getattr(model_params, "hc_mult", 0) or 0)
+    if hc_mult <= 1:
+        return None
+    return {
+        "hc_mult": hc_mult,
+        "hc_sinkhorn_iters": int(getattr(model_params, "hc_sinkhorn_iters", 20) or 20),
+        "hidden_size": int(get_hidden_size(model_params)),
+    }
+
+
 def get_vision_info(model_params):
     """Vision encoder params; None if text-only checkpoint."""
     n_layers = int(getattr(model_params, "vision_n_layers", 0) or 0)
@@ -85,21 +99,41 @@ def get_vision_info(model_params):
 
 
 def pre_process(model_params, args):
-    """Vision encoder + aligner (prefill only). Returns analyzer layer dicts."""
+    """Embedding (both stages) + optional vision encoder/aligner (prefill)."""
+    layers = []
+    batchsize = int(args["batchsize"])
+    seqlen = int(args.get("seqlen", 1) or 1)
+    w_byte = float(args["w_byte"])
+    a_byte = float(args["a_byte"])
+    hidden_size = int(get_hidden_size(model_params))
+    vocab_size = int(get_vocab_size(model_params))
+
+    # Token embedding: prefill uses full seq; decode embeds one new token.
+    layers.append(
+        embedding_cost(
+            batchsize, seqlen, hidden_size, vocab_size, w_byte, a_byte
+        ).as_kwargs("prefill")
+    )
+    layers.append(
+        embedding_cost(
+            batchsize, 1, hidden_size, vocab_size, w_byte, a_byte
+        ).as_kwargs("decode")
+    )
+
     vision = get_vision_info(model_params)
     if vision is None:
-        return []
+        return layers
 
     n_out = int(args.get("vision_tokens", 0) or 0)
     if n_out <= 0:
-        return []
+        return layers
 
     num_images = max(1, int(args.get("num_images", 1) or 1))
     n_out = min(n_out, vision["vision_max_n_token"])
     n_vit, n_out = vision_token_geometry(n_out, vision["vision_downsample_ratio"])
 
     dims = VisionDims(
-        batchsize=int(args["batchsize"]),
+        batchsize=batchsize,
         num_images=num_images,
         n_vit_tokens=n_vit,
         n_out_tokens=n_out,
@@ -110,11 +144,10 @@ def pre_process(model_params, args):
         vision_patch_size=vision["vision_patch_size"],
         downsample_ratio=vision["vision_downsample_ratio"],
         llm_hidden_size=vision["llm_hidden_size"],
-        w_byte=float(args["w_byte"]),
-        a_byte=float(args["a_byte"]),
+        w_byte=w_byte,
+        a_byte=a_byte,
     )
     op = create_vision_op(vision.get("kind", "deepseek_vit"))
-    layers = []
     for cost in op.prefill_costs(dims):
         layers.append(cost.as_kwargs("prefill"))
     return layers
@@ -123,16 +156,35 @@ def pre_process(model_params, args):
 def post_process(model_params, args):
     hiddensize = get_hidden_size(model_params)
     vocab_size = get_vocab_size(model_params)
+    batchsize = int(args["batchsize"])
+    seqlen = int(args.get("seqlen", 1) or 1)
+    w_byte = float(args["w_byte"])
+    a_byte = float(args["a_byte"])
     layers = []
+
+    hc = get_hc_info(model_params)
+    if hc is not None:
+        for stage, s in (("prefill", seqlen), ("decode", 1)):
+            dims = HcDims(
+                batchsize=batchsize,
+                seqlen=s,
+                hidden_size=int(hc["hidden_size"]),
+                hc_mult=int(hc["hc_mult"]),
+                sinkhorn_iters=int(hc["hc_sinkhorn_iters"]),
+                w_byte=w_byte,
+                a_byte=a_byte,
+            )
+            layers.append(hc_head_cost(dims).as_kwargs(stage))
+
     for stage in ["prefill", "decode"]:
         layers.append(
             {
                 "name": "lm_head",
                 "stage": stage,
-                "OPs": args["batchsize"] * hiddensize * vocab_size * 1,
-                "load_weight": hiddensize * vocab_size * args["w_byte"],
-                "load_act": hiddensize * args["a_byte"],
-                "store_act": vocab_size * args["a_byte"],
+                "OPs": batchsize * hiddensize * vocab_size * 1,
+                "load_weight": hiddensize * vocab_size * w_byte,
+                "load_act": hiddensize * a_byte,
+                "store_act": vocab_size * a_byte,
             }
         )
     return layers
@@ -170,7 +222,8 @@ def get_linear_layers(model_params, tp_size: int):
 # name -> input_names
 transformer_layer_graph = {
     "input": [],
-    "attn_norm": ["input"],
+    "attn_hc_pre": ["input"],
+    "attn_norm": ["attn_hc_pre"],
     "q_a_proj": ["attn_norm"],
     "q_b_proj": ["q_a_proj"],
     "k_proj": ["attn_norm"],
@@ -180,17 +233,19 @@ transformer_layer_graph = {
     "sv_matmul": ["softmax", "v_proj"],
     "o_a_proj": ["sv_matmul"],
     "o_b_proj": ["o_a_proj"],
-    "attn_add": ["input", "o_b_proj"],
-    "mlp_norm": ["attn_add"],
+    "attn_hc_post": ["input", "o_b_proj"],
+    "ffn_hc_pre": ["attn_hc_post"],
+    "mlp_norm": ["ffn_hc_pre"],
     "router": ["mlp_norm"],
     "experts": ["mlp_norm", "router"],
-    "mlp_add": ["attn_add", "experts"],
-    "output": ["mlp_add"],
+    "ffn_hc_post": ["attn_hc_post", "experts"],
+    "output": ["ffn_hc_post"],
 }
 
 flashattention_transformer_layer_graph = {
     "input": [],
-    "attn_norm": ["input"],
+    "attn_hc_pre": ["input"],
+    "attn_norm": ["attn_hc_pre"],
     "q_a_proj": ["attn_norm"],
     "q_b_proj": ["q_a_proj"],
     "k_proj": ["attn_norm"],
@@ -198,10 +253,11 @@ flashattention_transformer_layer_graph = {
     "fused_attention": ["q_b_proj", "k_proj", "v_proj"],
     "o_a_proj": ["fused_attention"],
     "o_b_proj": ["o_a_proj"],
-    "attn_add": ["input", "o_b_proj"],
-    "mlp_norm": ["attn_add"],
+    "attn_hc_post": ["input", "o_b_proj"],
+    "ffn_hc_pre": ["attn_hc_post"],
+    "mlp_norm": ["ffn_hc_pre"],
     "router": ["mlp_norm"],
     "experts": ["mlp_norm", "router"],
-    "mlp_add": ["attn_add", "experts"],
-    "output": ["mlp_add"],
+    "ffn_hc_post": ["attn_hc_post", "experts"],
+    "output": ["ffn_hc_post"],
 }

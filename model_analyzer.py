@@ -7,6 +7,7 @@ from utils import str_number, str_number_time
 import math
 from ops.attention import AttnDims, create_attention_op
 from ops.moe import MoeDims, create_moe_op
+from ops.hc import HcDims, block_hc_costs
 from report import aggregate_e2e
 
 ALL_DATA_NAMES = [
@@ -480,17 +481,35 @@ class ModelAnalyzer:
                 store_kv_cache=0,
             )
 
-        for name in ["attn_add", "mlp_add"]:
-            self._analyze_to_results(
-                "decode",
-                name,
-                OPs=batchsize * hidden_size * 1,
-                load_weight=0,
-                load_act=batchsize * hidden_size * 1 * a_byte,
-                store_act=batchsize * hidden_size * 1 * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
+        hc_info = (
+            config.get_hc_info(model_params)
+            if hasattr(config, "get_hc_info")
+            else None
+        )
+        if hc_info:
+            hc_dims_decode = HcDims(
+                batchsize=batchsize,
+                seqlen=1,
+                hidden_size=int(hc_info["hidden_size"]),
+                hc_mult=int(hc_info["hc_mult"]),
+                sinkhorn_iters=int(hc_info["hc_sinkhorn_iters"]),
+                w_byte=w_byte,
+                a_byte=a_byte,
             )
+            for layer_cost in block_hc_costs(hc_dims_decode):
+                self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+        else:
+            for name in ["attn_add", "mlp_add"]:
+                self._analyze_to_results(
+                    "decode",
+                    name,
+                    OPs=batchsize * hidden_size * 1,
+                    load_weight=0,
+                    load_act=batchsize * hidden_size * 1 * a_byte,
+                    store_act=batchsize * hidden_size * 1 * a_byte,
+                    load_kv_cache=0,
+                    store_kv_cache=0,
+                )
         if not moe_info:
             for name in ["mlp_act"]:
                 self._analyze_to_results(
@@ -516,17 +535,30 @@ class ModelAnalyzer:
                 load_kv_cache=0,
                 store_kv_cache=0,
             )
-        for name in ["attn_add", "mlp_add"]:
-            self._analyze_to_results(
-                "prefill",
-                name,
-                OPs=batchsize * hidden_size * seqlen * 1,
-                load_weight=0,
-                load_act=batchsize * hidden_size * seqlen * a_byte,
-                store_act=batchsize * hidden_size * seqlen * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
+        if hc_info:
+            hc_dims_prefill = HcDims(
+                batchsize=batchsize,
+                seqlen=seqlen,
+                hidden_size=int(hc_info["hidden_size"]),
+                hc_mult=int(hc_info["hc_mult"]),
+                sinkhorn_iters=int(hc_info["hc_sinkhorn_iters"]),
+                w_byte=w_byte,
+                a_byte=a_byte,
             )
+            for layer_cost in block_hc_costs(hc_dims_prefill):
+                self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+        else:
+            for name in ["attn_add", "mlp_add"]:
+                self._analyze_to_results(
+                    "prefill",
+                    name,
+                    OPs=batchsize * hidden_size * seqlen * 1,
+                    load_weight=0,
+                    load_act=batchsize * hidden_size * seqlen * a_byte,
+                    store_act=batchsize * hidden_size * seqlen * a_byte,
+                    load_kv_cache=0,
+                    store_kv_cache=0,
+                )
         if not moe_info:
             for name in ["mlp_act"]:
                 self._analyze_to_results(
@@ -609,10 +641,11 @@ class ModelAnalyzer:
         total_results["prefill"]["memory_consumption_weight"] = total_results["prefill"]["load_weight"]
         total_results["prefill"]["memory_consumption_kv_cache"] = kv_footprint
 
-        # vision encoder / aligner (prefill only; not multiplied by LLM depth)
+        # embedding / vision (not multiplied by LLM depth)
         if hasattr(self.config, "pre_process"):
             pre_args = {
                 "batchsize": batchsize,
+                "seqlen": seqlen,
                 "a_byte": a_byte,
                 "w_byte": w_byte,
                 "vision_tokens": vision_tokens,
@@ -625,9 +658,8 @@ class ModelAnalyzer:
                         layer_info["stage"]
                     ][layer_info["name"]][data_name]
 
-        # lm_head
-        name = "lm_head"
-        args = {"batchsize": batchsize, "a_byte": a_byte, "w_byte": w_byte}
+        # hc_head + lm_head (not multiplied by LLM depth)
+        args = {"batchsize": batchsize, "seqlen": seqlen, "a_byte": a_byte, "w_byte": w_byte}
         for layer_info in self.config.post_process(self.model_params, args):
             self._analyze_to_results(**layer_info)
             for data_name in ALL_DATA_NAMES:

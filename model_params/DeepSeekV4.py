@@ -20,6 +20,9 @@ _deepseek_v4_flash_vision_exp = EasyDict(
     num_experts_per_tok=6,
     moe_intermediate_size=2048,
     num_hash_layers=3,  # first 3 layers: hash MoE; rest: learned gate
+    # Manifold-Constrained Hyper-Connections (mHC)
+    hc_mult=4,
+    hc_sinkhorn_iters=20,
     # Vision encoder (DeepSeek-ViT + Aligner)
     vision_n_layers=32,
     vision_dim=1024,

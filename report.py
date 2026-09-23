@@ -48,7 +48,20 @@ _CATEGORY_RULES = [
     ),
     ("mlp", ("gate_proj", "up_proj", "down_proj", "mlp_act")),
     ("norm", ("attn_norm", "mlp_norm", "norm")),
+    (
+        "hc",
+        (
+            "attn_hc_pre",
+            "attn_hc_post",
+            "ffn_hc_pre",
+            "ffn_hc_post",
+            "hc_head",
+            "hc_pre",
+            "hc_post",
+        ),
+    ),
     ("residual", ("attn_add", "mlp_add")),
+    ("embedding", ("embedding",)),
     ("head", ("lm_head",)),
 ]
 
@@ -71,7 +84,10 @@ def layer_multiplier(
     num_learned_layers: Optional[int] = None,
 ) -> int:
     """Match ModelAnalyzer total aggregation weights."""
-    if layer_name == "lm_head" or layer_name.startswith("vision_"):
+    if (
+        layer_name in ("lm_head", "embedding", "hc_head")
+        or layer_name.startswith("vision_")
+    ):
         return 1
     if num_learned_layers is None:
         num_learned_layers = max(0, num_hidden_layers - num_hash_layers)
@@ -141,10 +157,12 @@ def aggregate_e2e(
     ordered = {}
     preferred = [
         "vision",
+        "embedding",
         "attn_proj",
         "attention",
         "moe",
         "mlp",
+        "hc",
         "norm",
         "residual",
         "head",
