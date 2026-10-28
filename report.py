@@ -103,6 +103,7 @@ def layer_multiplier(
         layer_name in ("lm_head", "embedding", "hc_head", "hc_expand", "kv_footprint")
         or layer_name.startswith("vision_")
         or layer_name.startswith("engram_")
+        or layer_name.startswith("tp_allgather")
     ):
         return 1
     if num_learned_layers is None:

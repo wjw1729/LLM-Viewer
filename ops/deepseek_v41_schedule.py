@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from ops.comm import CommLink, allreduce_bus_bytes, comm_fields
 from ops.attention.csa2 import (
     attention_costs,
     compressor_costs,
@@ -73,6 +74,9 @@ def component_order() -> List[str]:
             "engram_lookup",
             "engram_proj",
             "engram_gate",
+            "enc_tp_allreduce",
+            "dec_tp_allreduce",
+            "tp_allreduce_engram",
             "kv_footprint",
         ]
     )
@@ -145,6 +149,10 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
     a_byte = float(ctx["a_byte"])
     w_bit = int(round(float(ctx["w_byte"]) * 8))
     tp = max(1, int(ctx.get("tp_size") or 1))
+    link = CommLink(
+        bandwidth=float(ctx.get("comm_bandwidth") or 0.0),
+        latency=float(ctx.get("comm_latency") or 0.0),
+    )
 
     hidden = int(model_params.hidden_size)
     n_layers = int(model_params.num_hidden_layers)
@@ -501,6 +509,31 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
             )
         )
 
+    def collective_pair(name, length_prefill, per_token_bytes, group, mult):
+        def one(length):
+            bus = allreduce_bus_bytes(ntok(length) * per_token_bytes, group)
+            fields = comm_fields(bus, link, group)
+            fields["name"] = name
+            return fields
+
+        groups.append((name, mult, one(length_prefill), one(1)))
+
+    # wo_b is row-parallel: each rank holds a partial hidden sum.
+    collective_pair("enc_tp_allreduce", seqlen, hidden * a_byte, tp, n_enc)
+    collective_pair("dec_tp_allreduce", replay, hidden * a_byte, tp, n_dec)
+    engram_width = (
+        (int(model_params.engram_max_ngram_size) - 1)
+        * int(model_params.engram_n_heads)
+        * int(model_params.engram_head_dim)
+    )
+    collective_pair(
+        "tp_allreduce_engram",
+        seqlen,
+        engram_width * a_byte,
+        tp,
+        max(1, len(engram_ids)),
+    )
+
     entries = 0
     for layer in sorted(kv_sources):
         if layer >= n_layers:
@@ -553,7 +586,7 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
         f"reindex={dec_reindex}; reuse={len(enc_reuse)}enc+{len(dec_reuse)}dec; "
         f"engram={engram_ids}; engram_host={host:.3e}B; "
         f"kv=fp4_main({main_b:.0f}B)+fp4_index({index_b:.0f}B)+fp8_swa({swa_b:.0f}B); "
-        f"experts=fp{routed_bit}; mhc=single_pass; dspark=off"
+        f"experts=fp{routed_bit}; mhc=single_pass; dspark=off; tp={tp}"
     )
     return {
         "layers": layers,

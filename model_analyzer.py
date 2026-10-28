@@ -6,7 +6,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from utils import str_number, str_number_time
 import math
 from ops.attention import AttnDims, create_attention_op
-from ops.comm import CommLink
+from ops.comm import CommLink, allgather_bus_bytes, allreduce_bus_bytes, comm_fields
 from ops.moe import MoeDims, create_moe_op
 from ops.hc import HcDims, block_hc_costs
 from report import aggregate_e2e
@@ -443,6 +443,8 @@ class ModelAnalyzer:
                     "tp_size": tp_size,
                     "use_flashattention": use_flashattention,
                     "onchip_buffer": onchip_for_net,
+                    "comm_bandwidth": self.get_comm_link().bandwidth,
+                    "comm_latency": self.get_comm_link().latency,
                 },
             )
         if network:
@@ -528,13 +530,24 @@ class ModelAnalyzer:
                 head_size = config.get_head_size(model_params)
             else:
                 head_size = hidden_size // num_attention_heads
-        
+            local_heads = num_attention_heads
+            local_kv_heads = num_key_value_heads
+            if tp_size > 1:
+                if num_attention_heads % tp_size != 0:
+                    raise ValueError(
+                        f"tp_size={tp_size} must divide num_attention_heads={num_attention_heads}"
+                    )
+                local_heads = num_attention_heads // tp_size
+                # MQA keeps the single KV head replicated. GQA shards it when it divides.
+                if num_key_value_heads > 1 and num_key_value_heads % tp_size == 0:
+                    local_kv_heads = num_key_value_heads // tp_size
+
             _,_, onchip_buffer = self.get_hardware_info()
             attn_dims = AttnDims(
                 batchsize=batchsize,
                 seqlen=seqlen,
-                num_attention_heads=num_attention_heads,
-                num_key_value_heads=num_key_value_heads,
+                num_attention_heads=local_heads,
+                num_key_value_heads=local_kv_heads,
                 head_size=head_size,
                 a_byte=a_byte,
                 kv_byte=kv_byte,
@@ -648,6 +661,22 @@ class ModelAnalyzer:
                         store_kv_cache=0,
                     )
 
+            # Row-parallel outputs are partial sums. One allreduce per block.
+            linear_names = set(config.get_linear_layers(model_params, tp_size))
+            link = self.get_comm_link()
+            attn_parallel = any(n in linear_names for n in ("out_proj", "o_b_proj"))
+            mlp_parallel = "down_proj" in linear_names
+            if tp_size > 1 and (attn_parallel or mlp_parallel):
+                for stage, tokens in (("prefill", seqlen), ("decode", 1)):
+                    bus = allreduce_bus_bytes(
+                        batchsize * tokens * hidden_size * a_byte, tp_size
+                    )
+                    fields = comm_fields(bus, link, tp_size)
+                    if attn_parallel:
+                        self._analyze_to_results(stage, "tp_allreduce_attn", **fields)
+                    if mlp_parallel:
+                        self._analyze_to_results(stage, "tp_allreduce_mlp", **fields)
+
         # compute total
         total_results = {"decode": {}, "prefill": {}}
         for data_name in ALL_DATA_NAMES:
@@ -664,6 +693,8 @@ class ModelAnalyzer:
         def _moe_layer_multiplier(layer_name: str) -> int:
             if self.layer_multipliers and layer_name in self.layer_multipliers:
                 return int(self.layer_multipliers[layer_name])
+            if layer_name.startswith("tp_allgather"):
+                return 1
             if layer_name in ("hash_router", "hash_experts"):
                 return n_hash
             if layer_name in ("router", "experts"):
@@ -747,11 +778,27 @@ class ModelAnalyzer:
         # hc_head + lm_head (not multiplied by LLM depth)
         args = {"batchsize": batchsize, "seqlen": seqlen, "a_byte": a_byte, "w_byte": w_byte}
         for layer_info in self.config.post_process(self.model_params, args):
+            layer_info = dict(layer_info)
+            if tp_size > 1 and layer_info.get("name") == "lm_head":
+                # Vocabulary-parallel head: each rank owns 1/tp of the rows.
+                layer_info["OPs"] = layer_info.get("OPs", 0) / tp_size
+                layer_info["load_weight"] = layer_info.get("load_weight", 0) / tp_size
+                layer_info["store_act"] = layer_info.get("store_act", 0) / tp_size
             self._analyze_to_results(**layer_info)
             for data_name in ALL_DATA_NAMES:
                 total_results[layer_info["stage"]][data_name] += self.results[layer_info["stage"]][layer_info["name"]][
                     data_name
                 ]
+        if tp_size > 1 and hasattr(config, "get_vocab_size") and "lm_head" in self.results["prefill"]:
+            vocab = int(config.get_vocab_size(model_params))
+            link = self.get_comm_link()
+            for stage in ("prefill", "decode"):
+                # post_process scores one token per stage.
+                full = batchsize * vocab * a_byte
+                fields = comm_fields(allgather_bus_bytes(full, tp_size), link, tp_size)
+                self._analyze_to_results(stage, "tp_allgather_logits", **fields)
+                for data_name in ALL_DATA_NAMES:
+                    total_results[stage][data_name] += self.results[stage]["tp_allgather_logits"][data_name]
         # for stage in ["prefill", "decode"]:
         #     self._analyze_to_results(
         #         stage,
