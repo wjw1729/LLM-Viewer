@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from ops.comm import CommLink, allreduce_bus_bytes, comm_fields
+from ops.comm import CommLink, allreduce_bus_bytes, comm_fields, moe_alltoall_bytes
 from ops.attention.csa2 import (
     attention_costs,
     compressor_costs,
@@ -77,6 +77,10 @@ def component_order() -> List[str]:
             "enc_tp_allreduce",
             "dec_tp_allreduce",
             "tp_allreduce_engram",
+            "enc_ep_dispatch",
+            "enc_ep_combine",
+            "dec_ep_dispatch",
+            "dec_ep_combine",
             "kv_footprint",
         ]
     )
@@ -149,6 +153,7 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
     a_byte = float(ctx["a_byte"])
     w_bit = int(round(float(ctx["w_byte"]) * 8))
     tp = max(1, int(ctx.get("tp_size") or 1))
+    ep = max(1, int(ctx.get("ep_size") or 1))
     link = CommLink(
         bandwidth=float(ctx.get("comm_bandwidth") or 0.0),
         latency=float(ctx.get("comm_latency") or 0.0),
@@ -290,14 +295,19 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
             )
         return out
 
+    if n_routed % ep != 0:
+        raise ValueError(f"ep_size={ep} must divide n_routed_experts={n_routed}")
+    local_routed = n_routed // ep
+    local_topk = topk / ep
     expert_params = 3 * hidden * inter
-    active_w = topk * _weight_bytes(expert_params, routed_bit) + n_shared * _weight_bytes(
+    # Router stays replicated. Routed experts are sharded; the shared expert is not.
+    active_w = local_topk * _weight_bytes(expert_params, routed_bit) + n_shared * _weight_bytes(
         expert_params, w_bit
     )
-    full_w = n_routed * _weight_bytes(expert_params, routed_bit) + n_shared * _weight_bytes(
+    full_w = local_routed * _weight_bytes(expert_params, routed_bit) + n_shared * _weight_bytes(
         expert_params, w_bit
     )
-    n_active = topk + n_shared
+    n_active = local_topk + n_shared
 
     def moe_pair(prefix: str, length_prefill: int):
         def one(length: int, stem: str, ops: float, weight: float, store_h: bool):
@@ -534,6 +544,20 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
         max(1, len(engram_ids)),
     )
 
+    def alltoall_pair(name, length_prefill, group, mult):
+        def one(length):
+            sent = moe_alltoall_bytes(ntok(length), hidden, a_byte, group, topk)
+            fields = comm_fields(sent, link, group)
+            fields["name"] = name
+            return fields
+
+        groups.append((name, mult, one(length_prefill), one(1)))
+
+    alltoall_pair("enc_ep_dispatch", seqlen, ep, n_enc)
+    alltoall_pair("enc_ep_combine", seqlen, ep, n_enc)
+    alltoall_pair("dec_ep_dispatch", replay, ep, n_dec)
+    alltoall_pair("dec_ep_combine", replay, ep, n_dec)
+
     entries = 0
     for layer in sorted(kv_sources):
         if layer >= n_layers:
@@ -586,7 +610,7 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
         f"reindex={dec_reindex}; reuse={len(enc_reuse)}enc+{len(dec_reuse)}dec; "
         f"engram={engram_ids}; engram_host={host:.3e}B; "
         f"kv=fp4_main({main_b:.0f}B)+fp4_index({index_b:.0f}B)+fp8_swa({swa_b:.0f}B); "
-        f"experts=fp{routed_bit}; mhc=single_pass; dspark=off; tp={tp}"
+        f"experts=fp{routed_bit}; mhc=single_pass; dspark=off; tp={tp}; ep={ep}"
     )
     return {
         "layers": layers,

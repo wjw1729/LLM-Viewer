@@ -33,6 +33,12 @@ parser.add_argument(
     help="the number of devices for tensor parallelism to use",
 )
 parser.add_argument(
+    "--ep-size",
+    type=int,
+    default=1,
+    help="expert-parallel group size; routed experts are sharded across the group",
+)
+parser.add_argument(
     "--attention-type",
     type=str,
     default=None,
@@ -85,6 +91,7 @@ ret = analyzer.analyze_generate_task(
     args.kv_bit,
     args.use_flashattention,
     tp_size=args.tp_size,
+    ep_size=args.ep_size,
     attention_type=args.attention_type,
     window_size=args.window_size,
     compress_ratio=args.compress_ratio,

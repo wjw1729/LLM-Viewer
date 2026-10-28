@@ -56,6 +56,7 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
     use_flashattention = bool(inference_config["use_flashattention"])
     gen_length = int(inference_config["gen_length"])
     tp_size = int(inference_config["tp_size"])
+    ep_size = int(inference_config.get("ep_size", 1) or 1)
     attention_type = inference_config.get("attention_type")
     window_size= inference_config.get("window_size")
     if window_size is not None:
@@ -80,6 +81,7 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
         kv_bit=kv_bit,
         use_flashattention=use_flashattention,
         tp_size=tp_size,
+        ep_size=ep_size,
         attention_type=attention_type,
         window_size=window_size,
         compress_ratio=compress_ratio,

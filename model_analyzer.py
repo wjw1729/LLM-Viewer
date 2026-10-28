@@ -6,7 +6,13 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from utils import str_number, str_number_time
 import math
 from ops.attention import AttnDims, create_attention_op
-from ops.comm import CommLink, allgather_bus_bytes, allreduce_bus_bytes, comm_fields
+from ops.comm import (
+    CommLink,
+    allgather_bus_bytes,
+    allreduce_bus_bytes,
+    comm_fields,
+    moe_alltoall_bytes,
+)
 from ops.moe import MoeDims, create_moe_op
 from ops.hc import HcDims, block_hc_costs
 from report import aggregate_e2e
@@ -220,7 +226,7 @@ class ModelAnalyzer:
                 f.write(
                     f"\n\n=== {self.model_id} {self.hardware} w_bit={self.w_bit} "
                     f"a_bit={self.a_bit} kv_bit={self.kv_bit} batchsize={self.batchsize} "
-                    f"seqlen={self.seqlen} tp_size={self.tp_size} {attn_meta}"
+                    f"seqlen={self.seqlen} tp_size={self.tp_size} ep_size={self.ep_size} {attn_meta}"
                     f"{(' ' + self.analysis_note) if self.analysis_note else ''} ===\n"
                 )
                 f.write(
@@ -326,6 +332,7 @@ class ModelAnalyzer:
         use_flashattention=False,
         kv_token_ratio=1,
         tp_size: int = 1,
+        ep_size: int = 1,
         attention_type=None,
         window_size=None,
         compress_ratio=None,
@@ -342,6 +349,7 @@ class ModelAnalyzer:
         use_flashattention: use flash attention/flash decoding
         kv_token_ratio: use this for KV compression
         tp_size: the number of devices for tensor parallelism to use
+        ep_size: expert-parallel group size (routed experts are sharded)
         vision_tokens: LLM-side vision tokens after aligner (0/None disables encoder)
         num_images: number of images in the prompt (prefill only)
 
@@ -394,6 +402,8 @@ class ModelAnalyzer:
         self.batchsize = batchsize
         self.seqlen = seqlen
         self.tp_size = tp_size
+        self.ep_size = max(1, int(ep_size))
+        ep_size = self.ep_size
 
         # Default: if model has a vision encoder and caller didn't set tokens, use max
         if vision_tokens is None and hasattr(self.config, "get_vision_info"):
@@ -441,6 +451,7 @@ class ModelAnalyzer:
                     "a_byte": a_byte,
                     "kv_byte": kv_byte,
                     "tp_size": tp_size,
+                    "ep_size": ep_size,
                     "use_flashattention": use_flashattention,
                     "onchip_buffer": onchip_for_net,
                     "comm_bandwidth": self.get_comm_link().bandwidth,
@@ -512,18 +523,46 @@ class ModelAnalyzer:
                 moe_info["num_hash_layers"] = n_hash
                 moe_info["num_learned_layers"] = n_learned
 
+                n_routed = int(moe_info["n_routed_experts"])
+                if n_routed % ep_size != 0:
+                    raise ValueError(
+                        f"ep_size={ep_size} must divide n_routed_experts={n_routed}"
+                    )
+                topk = int(moe_info["num_experts_per_tok"])
+                n_shared = int(moe_info["n_shared_experts"])
+                # Gate stays replicated. Only the expert GEMM shrinks: each rank
+                # holds n_routed/ep experts, so a token activates topk/ep of them.
+                expert_scale = 1.0
+                if ep_size > 1:
+                    expert_scale = (topk / ep_size + n_shared) / (topk + n_shared)
+
+                def _record_moe(costs, stage):
+                    for layer_cost in costs:
+                        if expert_scale != 1.0 and str(layer_cost.name).endswith("experts"):
+                            layer_cost.OPs *= expert_scale
+                            layer_cost.load_weight *= expert_scale
+                        self._analyze_to_results(**layer_cost.as_kwargs(stage))
+
                 if n_hash > 0:
                     hash_moe = create_moe_op("hash")
-                    for layer_cost in hash_moe.decode_costs(moe_dims):
-                        self._analyze_to_results(**layer_cost.as_kwargs("decode"))
-                    for layer_cost in hash_moe.prefill_costs(moe_dims):
-                        self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+                    _record_moe(hash_moe.decode_costs(moe_dims), "decode")
+                    _record_moe(hash_moe.prefill_costs(moe_dims), "prefill")
                 if n_learned > 0:
                     learned_moe = create_moe_op("learned")
-                    for layer_cost in learned_moe.decode_costs(moe_dims):
-                        self._analyze_to_results(**layer_cost.as_kwargs("decode"))
-                    for layer_cost in learned_moe.prefill_costs(moe_dims):
-                        self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+                    _record_moe(learned_moe.decode_costs(moe_dims), "decode")
+                    _record_moe(learned_moe.prefill_costs(moe_dims), "prefill")
+                link = self.get_comm_link()
+                for stage, tokens in (("prefill", seqlen), ("decode", 1)):
+                    sent = moe_alltoall_bytes(
+                        batchsize * tokens,
+                        moe_info["hidden_size"],
+                        a_byte,
+                        ep_size,
+                        topk,
+                    )
+                    fields = comm_fields(sent, link, ep_size)
+                    self._analyze_to_results(stage, "ep_dispatch", **fields)
+                    self._analyze_to_results(stage, "ep_combine", **fields)
 
             # for attention
             if hasattr(config, "get_head_size"):
@@ -665,7 +704,8 @@ class ModelAnalyzer:
             linear_names = set(config.get_linear_layers(model_params, tp_size))
             link = self.get_comm_link()
             attn_parallel = any(n in linear_names for n in ("out_proj", "o_b_proj"))
-            mlp_parallel = "down_proj" in linear_names
+            # EP already returns the summed expert output. A dense MLP still allreduces.
+            mlp_parallel = "down_proj" in linear_names and ep_size <= 1
             if tp_size > 1 and (attn_parallel or mlp_parallel):
                 for stage, tokens in (("prefill", seqlen), ("decode", 1)):
                     bus = allreduce_bus_bytes(
@@ -718,9 +758,9 @@ class ModelAnalyzer:
                 seqlen=seqlen,
                 hidden_size=moe_info["hidden_size"],
                 moe_intermediate_size=moe_info["moe_intermediate_size"],
-                n_routed_experts=moe_info["n_routed_experts"],
+                n_routed_experts=int(moe_info["n_routed_experts"]) // ep_size,
                 n_shared_experts=moe_info["n_shared_experts"],
-                num_experts_per_tok=moe_info["num_experts_per_tok"],
+                num_experts_per_tok=moe_info["num_experts_per_tok"] / ep_size,
                 w_byte=w_byte,
                 a_byte=a_byte,
             )
@@ -842,6 +882,7 @@ class ModelAnalyzer:
         kv_bit=None,
         use_flashattention = False,
         tp_size: int = 1,
+        ep_size: int = 1,
         attention_type=None,
         window_size=None,
         compress_ratio=None,
@@ -857,6 +898,7 @@ class ModelAnalyzer:
             kv_bit,
             use_flashattention=use_flashattention,
             tp_size=tp_size,
+            ep_size=ep_size,
             attention_type=attention_type,
             window_size=window_size,
             compress_ratio=compress_ratio,
@@ -875,6 +917,7 @@ class ModelAnalyzer:
                 kv_bit,
                 use_flashattention=use_flashattention,
                 tp_size=tp_size,
+                ep_size=ep_size,
                 attention_type=attention_type,
                 window_size=window_size,
                 compress_ratio=compress_ratio,
