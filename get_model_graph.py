@@ -117,7 +117,11 @@ def get_model_graph(model_id, hardware, config_path, inference_config):
             edge = {"source": input_name, "target": name}
             edges.append(edge)
 
-    if use_flashattention:
+    if hasattr(analyzer.config, "get_transformer_layer_graph"):
+        layer_graph = analyzer.config.get_transformer_layer_graph(
+            analyzer.model_params, use_flashattention
+        )
+    elif use_flashattention:
         layer_graph = analyzer.config.flashattention_transformer_layer_graph
     else:
         layer_graph = analyzer.config.transformer_layer_graph

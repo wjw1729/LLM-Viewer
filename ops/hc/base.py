@@ -129,11 +129,28 @@ def embedding_cost(
     )
 
 
-def block_hc_costs(dims: HcDims) -> List[HcLayerCost]:
-    """Per transformer block: attn + ffn Hyper-Connections (replaces residual adds)."""
-    return [
+def block_hc_costs(dims: HcDims, single_pass: bool = False) -> List[HcLayerCost]:
+    """Per transformer block: attn + ffn Hyper-Connections (replaces residual adds).
+
+    single_pass: DeepSeek-V4.1 Mega-mHC. Same FLOPs, but activation traffic is the
+    fused lower bound of (2n+2)d reads+writes per sublayer (attn and ffn).
+    """
+    costs = [
         hc_pre_cost(dims, "attn_hc_pre"),
         hc_post_cost(dims, "attn_hc_post"),
         hc_pre_cost(dims, "ffn_hc_pre"),
         hc_post_cost(dims, "ffn_hc_post"),
     ]
+    if not single_pass:
+        return costs
+    n = max(1, int(dims.hc_mult))
+    tokens = dims.batchsize * dims.seqlen
+    # Paper: (n+1)d reads and (n+1)d writes per sublayer.
+    traffic = (2 * n + 2) * dims.hidden_size * tokens * dims.a_byte
+    quarter = traffic / 4.0
+    for i in range(0, 4, 2):
+        costs[i].load_act = quarter
+        costs[i].store_act = quarter
+        costs[i + 1].load_act = quarter
+        costs[i + 1].store_act = quarter
+    return costs

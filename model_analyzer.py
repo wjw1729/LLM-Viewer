@@ -60,6 +60,11 @@ class ModelAnalyzer:
         self.window_size = None
         self.compress_ratio = None
         self.index_topk = None
+        self.layer_multipliers = {}
+        self.weight_footprint_extra = 0.0
+        self.kv_footprint_exact = False
+        self.use_network_schedule = False
+        self.analysis_note = ""
 
     def _resolve_attention_type(
         self,
@@ -109,6 +114,21 @@ class ModelAnalyzer:
 
         bandwidth, max_OPS, onchip_buffer = self.get_hardware_info()
         memory_access = load_weight + load_act + store_act + load_kv_cache + store_kv_cache
+        if OPs == 0 and memory_access == 0:
+            self.results[stage][name] = {
+                "OPs": 0,
+                "memory_access": 0,
+                "arithmetic_intensity": 0,
+                "performance": 0,
+                "bound": "memory",
+                "load_weight": 0,
+                "load_act": 0,
+                "store_act": 0,
+                "load_kv_cache": 0,
+                "store_kv_cache": 0,
+                "inference_time": 0,
+            }
+            return
         arithmetic_intensity, performance, bound = roofline_analyze(bandwidth, max_OPS, OPs, memory_access)
         # Pure memory moves (OPs==0) are timed as memory_access / bandwidth.
         if performance == 0:
@@ -169,6 +189,7 @@ class ModelAnalyzer:
                 num_hidden_layers=num_hidden_layers,
                 num_hash_layers=n_hash,
                 num_learned_layers=n_learned,
+                layer_multipliers=self.layer_multipliers,
             )
             total = self.results.get("total_results", {}).get(stage, {})
             e2e_time = report["e2e"]["inference_time"]
@@ -181,7 +202,8 @@ class ModelAnalyzer:
                 f.write(
                     f"\n\n=== {self.model_id} {self.hardware} w_bit={self.w_bit} "
                     f"a_bit={self.a_bit} kv_bit={self.kv_bit} batchsize={self.batchsize} "
-                    f"seqlen={self.seqlen} tp_size={self.tp_size} {attn_meta} ===\n"
+                    f"seqlen={self.seqlen} tp_size={self.tp_size} {attn_meta}"
+                    f"{(' ' + self.analysis_note) if self.analysis_note else ''} ===\n"
                 )
                 f.write(
                     "# Per-block ops (one transformer block; MoE shows both hash & learned routers)\n"
@@ -384,193 +406,229 @@ class ModelAnalyzer:
         num_hidden_layers = config.get_num_hidden_layers(model_params)
         moe_info = config.get_moe_info(model_params) if hasattr(config, "get_moe_info") else None
 
-        for name, (ic, oc) in config.get_linear_layers(model_params, tp_size).items():
-            # for linear layers
-            is_kv_proj = name in ["k_proj", "v_proj"]
-            is_normal_proj = not is_kv_proj
-            self._analyze_to_results(
-                "decode",
-                name,
-                OPs=ic * oc * batchsize * 2,
-                load_weight=ic * oc * w_byte,
-                load_act=ic * batchsize * a_byte,
-                store_act=0 if is_kv_proj else oc * batchsize * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=(0 if is_normal_proj else oc * batchsize * kv_byte),
+        self.layer_multipliers = {}
+        self.weight_footprint_extra = 0.0
+        self.kv_footprint_exact = False
+        self.use_network_schedule = False
+        self.analysis_note = ""
+        network = None
+        if hasattr(config, "network_costs"):
+            _, _, onchip_for_net = self.get_hardware_info()
+            network = config.network_costs(
+                model_params,
+                {
+                    "batchsize": batchsize,
+                    "seqlen": seqlen,
+                    "w_byte": w_byte,
+                    "a_byte": a_byte,
+                    "kv_byte": kv_byte,
+                    "tp_size": tp_size,
+                    "use_flashattention": use_flashattention,
+                    "onchip_buffer": onchip_for_net,
+                },
             )
-            # for prefill
-            self._analyze_to_results(
-                "prefill",
-                name,
-                OPs=ic * oc * batchsize * seqlen * 2,
-                load_weight=ic * oc * w_byte,
-                load_act=ic * batchsize * seqlen * a_byte,
-                store_act=(0 if is_kv_proj else oc * batchsize * seqlen * a_byte),
-                load_kv_cache=0,
-                store_kv_cache=(0 if is_normal_proj else oc * batchsize * seqlen * kv_byte),
-            )
-
-        # MoE FFN: hash-gate layers + learned-gate layers (DeepSeek-V4 style)
-        if moe_info:
-            moe_dims = MoeDims(
-                batchsize=batchsize,
-                seqlen=seqlen,
-                hidden_size=moe_info["hidden_size"],
-                moe_intermediate_size=moe_info["moe_intermediate_size"],
-                n_routed_experts=moe_info["n_routed_experts"],
-                n_shared_experts=moe_info["n_shared_experts"],
-                num_experts_per_tok=moe_info["num_experts_per_tok"],
-                w_byte=w_byte,
-                a_byte=a_byte,
-            )
-            n_hash = int(moe_info.get("num_hash_layers", 0) or 0)
-            n_learned = int(
-                moe_info.get("num_learned_layers", num_hidden_layers - n_hash)
-            )
-            # Clamp in case config is inconsistent
-            n_hash = max(0, min(n_hash, num_hidden_layers))
-            n_learned = num_hidden_layers - n_hash
-            moe_info = dict(moe_info)
-            moe_info["num_hash_layers"] = n_hash
-            moe_info["num_learned_layers"] = n_learned
-
-            if n_hash > 0:
-                hash_moe = create_moe_op("hash")
-                for layer_cost in hash_moe.decode_costs(moe_dims):
-                    self._analyze_to_results(**layer_cost.as_kwargs("decode"))
-                for layer_cost in hash_moe.prefill_costs(moe_dims):
-                    self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
-            if n_learned > 0:
-                learned_moe = create_moe_op("learned")
-                for layer_cost in learned_moe.decode_costs(moe_dims):
-                    self._analyze_to_results(**layer_cost.as_kwargs("decode"))
-                for layer_cost in learned_moe.prefill_costs(moe_dims):
-                    self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
-
-        # for attention
-        if hasattr(config, "get_head_size"):
-            head_size = config.get_head_size(model_params)
+        if network:
+            self.use_network_schedule = True
+            self.layer_multipliers = dict(network.get("multipliers") or {})
+            self.weight_footprint_extra = float(network.get("weight_footprint_extra") or 0.0)
+            self.kv_footprint_exact = bool(network.get("kv_footprint_exact", True))
+            self.analysis_note = network.get("note") or ""
+            if network.get("attention_type"):
+                self.attention_type = network["attention_type"]
+            if network.get("window_size"):
+                self.window_size = network["window_size"]
+            if network.get("index_topk"):
+                self.index_topk = network["index_topk"]
+            for layer in network["layers"]:
+                self._analyze_to_results(**layer)
         else:
-            head_size = hidden_size // num_attention_heads
-        
-        _,_, onchip_buffer = self.get_hardware_info()
-        attn_dims = AttnDims(
-            batchsize=batchsize,
-            seqlen=seqlen,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_size=head_size,
-            a_byte=a_byte,
-            kv_byte=kv_byte,
-            onchip_buffer=onchip_buffer,
-        )
-        for layer_cost in attn_op.decode_costs(attn_dims,use_flashattention):
-            self._analyze_to_results(**layer_cost.as_kwargs("decode"))
-        for layer_cost in attn_op.prefill_costs(attn_dims,use_flashattention): 
-            self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
-        for name in config.get_norm_layers(model_params):
-            # sum sub pow sum div mul add
-            self._analyze_to_results(
-                "decode",
-                name,
-                OPs=batchsize * hidden_size * 1 * 7,
-                load_weight=0,
-                load_act=batchsize * hidden_size * 1 * a_byte,
-                store_act=batchsize * hidden_size * 1 * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
-
-        hc_info = (
-            config.get_hc_info(model_params)
-            if hasattr(config, "get_hc_info")
-            else None
-        )
-        if hc_info:
-            hc_dims_decode = HcDims(
-                batchsize=batchsize,
-                seqlen=1,
-                hidden_size=int(hc_info["hidden_size"]),
-                hc_mult=int(hc_info["hc_mult"]),
-                sinkhorn_iters=int(hc_info["hc_sinkhorn_iters"]),
-                w_byte=w_byte,
-                a_byte=a_byte,
-            )
-            for layer_cost in block_hc_costs(hc_dims_decode):
-                self._analyze_to_results(**layer_cost.as_kwargs("decode"))
-        else:
-            for name in ["attn_add", "mlp_add"]:
+            for name, (ic, oc) in config.get_linear_layers(model_params, tp_size).items():
+                # for linear layers
+                is_kv_proj = name in ["k_proj", "v_proj"]
+                is_normal_proj = not is_kv_proj
                 self._analyze_to_results(
                     "decode",
                     name,
-                    OPs=batchsize * hidden_size * 1,
+                    OPs=ic * oc * batchsize * 2,
+                    load_weight=ic * oc * w_byte,
+                    load_act=ic * batchsize * a_byte,
+                    store_act=0 if is_kv_proj else oc * batchsize * a_byte,
+                    load_kv_cache=0,
+                    store_kv_cache=(0 if is_normal_proj else oc * batchsize * kv_byte),
+                )
+                # for prefill
+                self._analyze_to_results(
+                    "prefill",
+                    name,
+                    OPs=ic * oc * batchsize * seqlen * 2,
+                    load_weight=ic * oc * w_byte,
+                    load_act=ic * batchsize * seqlen * a_byte,
+                    store_act=(0 if is_kv_proj else oc * batchsize * seqlen * a_byte),
+                    load_kv_cache=0,
+                    store_kv_cache=(0 if is_normal_proj else oc * batchsize * seqlen * kv_byte),
+                )
+
+            # MoE FFN: hash-gate layers + learned-gate layers (DeepSeek-V4 style)
+            if moe_info:
+                moe_dims = MoeDims(
+                    batchsize=batchsize,
+                    seqlen=seqlen,
+                    hidden_size=moe_info["hidden_size"],
+                    moe_intermediate_size=moe_info["moe_intermediate_size"],
+                    n_routed_experts=moe_info["n_routed_experts"],
+                    n_shared_experts=moe_info["n_shared_experts"],
+                    num_experts_per_tok=moe_info["num_experts_per_tok"],
+                    w_byte=w_byte,
+                    a_byte=a_byte,
+                )
+                n_hash = int(moe_info.get("num_hash_layers", 0) or 0)
+                n_learned = int(
+                    moe_info.get("num_learned_layers", num_hidden_layers - n_hash)
+                )
+                # Clamp in case config is inconsistent
+                n_hash = max(0, min(n_hash, num_hidden_layers))
+                n_learned = num_hidden_layers - n_hash
+                moe_info = dict(moe_info)
+                moe_info["num_hash_layers"] = n_hash
+                moe_info["num_learned_layers"] = n_learned
+
+                if n_hash > 0:
+                    hash_moe = create_moe_op("hash")
+                    for layer_cost in hash_moe.decode_costs(moe_dims):
+                        self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+                    for layer_cost in hash_moe.prefill_costs(moe_dims):
+                        self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+                if n_learned > 0:
+                    learned_moe = create_moe_op("learned")
+                    for layer_cost in learned_moe.decode_costs(moe_dims):
+                        self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+                    for layer_cost in learned_moe.prefill_costs(moe_dims):
+                        self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+
+            # for attention
+            if hasattr(config, "get_head_size"):
+                head_size = config.get_head_size(model_params)
+            else:
+                head_size = hidden_size // num_attention_heads
+        
+            _,_, onchip_buffer = self.get_hardware_info()
+            attn_dims = AttnDims(
+                batchsize=batchsize,
+                seqlen=seqlen,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_size=head_size,
+                a_byte=a_byte,
+                kv_byte=kv_byte,
+                onchip_buffer=onchip_buffer,
+            )
+            for layer_cost in attn_op.decode_costs(attn_dims,use_flashattention):
+                self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+            for layer_cost in attn_op.prefill_costs(attn_dims,use_flashattention): 
+                self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+            for name in config.get_norm_layers(model_params):
+                # sum sub pow sum div mul add
+                self._analyze_to_results(
+                    "decode",
+                    name,
+                    OPs=batchsize * hidden_size * 1 * 7,
                     load_weight=0,
                     load_act=batchsize * hidden_size * 1 * a_byte,
                     store_act=batchsize * hidden_size * 1 * a_byte,
                     load_kv_cache=0,
                     store_kv_cache=0,
                 )
-        if not moe_info:
-            for name in ["mlp_act"]:
-                self._analyze_to_results(
-                    "decode",
-                    name,
-                    OPs=batchsize * hidden_size * 1 * 2,
-                    load_weight=0,
-                    load_act=batchsize * hidden_size * 1 * a_byte * 2,
-                    store_act=batchsize * hidden_size * 1 * a_byte,
-                    load_kv_cache=0,
-                    store_kv_cache=0,
+
+            hc_info = (
+                config.get_hc_info(model_params)
+                if hasattr(config, "get_hc_info")
+                else None
+            )
+            if hc_info:
+                hc_dims_decode = HcDims(
+                    batchsize=batchsize,
+                    seqlen=1,
+                    hidden_size=int(hc_info["hidden_size"]),
+                    hc_mult=int(hc_info["hc_mult"]),
+                    sinkhorn_iters=int(hc_info["hc_sinkhorn_iters"]),
+                    w_byte=w_byte,
+                    a_byte=a_byte,
                 )
+                for layer_cost in block_hc_costs(hc_dims_decode):
+                    self._analyze_to_results(**layer_cost.as_kwargs("decode"))
+            else:
+                for name in ["attn_add", "mlp_add"]:
+                    self._analyze_to_results(
+                        "decode",
+                        name,
+                        OPs=batchsize * hidden_size * 1,
+                        load_weight=0,
+                        load_act=batchsize * hidden_size * 1 * a_byte,
+                        store_act=batchsize * hidden_size * 1 * a_byte,
+                        load_kv_cache=0,
+                        store_kv_cache=0,
+                    )
+            if not moe_info:
+                for name in ["mlp_act"]:
+                    self._analyze_to_results(
+                        "decode",
+                        name,
+                        OPs=batchsize * hidden_size * 1 * 2,
+                        load_weight=0,
+                        load_act=batchsize * hidden_size * 1 * a_byte * 2,
+                        store_act=batchsize * hidden_size * 1 * a_byte,
+                        load_kv_cache=0,
+                        store_kv_cache=0,
+                    )
 
         
-        for name in config.get_norm_layers(model_params):
-            self._analyze_to_results(
-                "prefill",
-                name,
-                OPs=batchsize * hidden_size * seqlen * 7,
-                load_weight=0,
-                load_act=batchsize * hidden_size * seqlen * a_byte,
-                store_act=batchsize * hidden_size * seqlen * a_byte,
-                load_kv_cache=0,
-                store_kv_cache=0,
-            )
-        if hc_info:
-            hc_dims_prefill = HcDims(
-                batchsize=batchsize,
-                seqlen=seqlen,
-                hidden_size=int(hc_info["hidden_size"]),
-                hc_mult=int(hc_info["hc_mult"]),
-                sinkhorn_iters=int(hc_info["hc_sinkhorn_iters"]),
-                w_byte=w_byte,
-                a_byte=a_byte,
-            )
-            for layer_cost in block_hc_costs(hc_dims_prefill):
-                self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
-        else:
-            for name in ["attn_add", "mlp_add"]:
+            for name in config.get_norm_layers(model_params):
                 self._analyze_to_results(
                     "prefill",
                     name,
-                    OPs=batchsize * hidden_size * seqlen * 1,
+                    OPs=batchsize * hidden_size * seqlen * 7,
                     load_weight=0,
                     load_act=batchsize * hidden_size * seqlen * a_byte,
                     store_act=batchsize * hidden_size * seqlen * a_byte,
                     load_kv_cache=0,
                     store_kv_cache=0,
                 )
-        if not moe_info:
-            for name in ["mlp_act"]:
-                self._analyze_to_results(
-                    "prefill",
-                    name,
-                    OPs=batchsize * hidden_size * seqlen * 1 * 2,
-                    load_weight=0,
-                    load_act=batchsize * hidden_size * seqlen * a_byte * 2,
-                    store_act=batchsize * hidden_size * seqlen * a_byte,
-                    load_kv_cache=0,
-                    store_kv_cache=0,
+            if hc_info:
+                hc_dims_prefill = HcDims(
+                    batchsize=batchsize,
+                    seqlen=seqlen,
+                    hidden_size=int(hc_info["hidden_size"]),
+                    hc_mult=int(hc_info["hc_mult"]),
+                    sinkhorn_iters=int(hc_info["hc_sinkhorn_iters"]),
+                    w_byte=w_byte,
+                    a_byte=a_byte,
                 )
+                for layer_cost in block_hc_costs(hc_dims_prefill):
+                    self._analyze_to_results(**layer_cost.as_kwargs("prefill"))
+            else:
+                for name in ["attn_add", "mlp_add"]:
+                    self._analyze_to_results(
+                        "prefill",
+                        name,
+                        OPs=batchsize * hidden_size * seqlen * 1,
+                        load_weight=0,
+                        load_act=batchsize * hidden_size * seqlen * a_byte,
+                        store_act=batchsize * hidden_size * seqlen * a_byte,
+                        load_kv_cache=0,
+                        store_kv_cache=0,
+                    )
+            if not moe_info:
+                for name in ["mlp_act"]:
+                    self._analyze_to_results(
+                        "prefill",
+                        name,
+                        OPs=batchsize * hidden_size * seqlen * 1 * 2,
+                        load_weight=0,
+                        load_act=batchsize * hidden_size * seqlen * a_byte * 2,
+                        store_act=batchsize * hidden_size * seqlen * a_byte,
+                        load_kv_cache=0,
+                        store_kv_cache=0,
+                    )
 
         # compute total
         total_results = {"decode": {}, "prefill": {}}
@@ -586,6 +644,8 @@ class ModelAnalyzer:
             n_learned = int(moe_info.get("num_learned_layers", num_hidden_layers - n_hash))
 
         def _moe_layer_multiplier(layer_name: str) -> int:
+            if self.layer_multipliers and layer_name in self.layer_multipliers:
+                return int(self.layer_multipliers[layer_name])
             if layer_name in ("hash_router", "hash_experts"):
                 return n_hash
             if layer_name in ("router", "experts"):
@@ -598,8 +658,12 @@ class ModelAnalyzer:
                 for data_name in ALL_DATA_NAMES:
                     total_results[stage][data_name] += result[data_name] * mult
 
-        # MoE: roofline used activated experts; HBM footprint must count all experts
-        if moe_info:
+        # MoE: roofline used activated experts; HBM footprint must count all experts.
+        # V4.1 supplies its own extra (FP4 routed experts + FP8/BF16 shared expert).
+        if self.use_network_schedule:
+            total_results["prefill"]["load_weight"] += self.weight_footprint_extra
+            total_results["decode"]["load_weight"] += self.weight_footprint_extra
+        elif moe_info:
             moe_dims = MoeDims(
                 batchsize=batchsize,
                 seqlen=seqlen,
@@ -622,8 +686,12 @@ class ModelAnalyzer:
         # k/v
         kv_cache_tokens = attn_op.kv_cache_tokens(seqlen)
         kv_footprint = total_results["prefill"]["store_kv_cache"]
-        if seqlen>0 and kv_cache_tokens<seqlen:
-            kv_footprint = kv_footprint * (kv_cache_tokens/seqlen)
+        if (
+            not self.kv_footprint_exact
+            and seqlen > 0
+            and kv_cache_tokens < seqlen
+        ):
+            kv_footprint = kv_footprint * (kv_cache_tokens / seqlen)
         
         weight_kv_footprint = total_results["prefill"]["load_weight"] + kv_footprint
         decode_tmp_act = 0
@@ -687,12 +755,14 @@ class ModelAnalyzer:
                 num_hidden_layers=num_hidden_layers,
                 num_hash_layers=n_hash,
                 num_learned_layers=n_learned,
+                layer_multipliers=self.layer_multipliers,
             ),
             "prefill": aggregate_e2e(
                 self.results["prefill"],
                 num_hidden_layers=num_hidden_layers,
                 num_hash_layers=n_hash,
                 num_learned_layers=n_learned,
+                layer_multipliers=self.layer_multipliers,
             ),
         }
         return self.results

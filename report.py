@@ -31,6 +31,7 @@ _CATEGORY_RULES = [
             "fused_attention",
             "compressor",
             "indexer",
+            "kv_build",
         ),
     ),
     (
@@ -43,6 +44,7 @@ _CATEGORY_RULES = [
             "q_proj",
             "k_proj",
             "v_proj",
+            "kv_proj",
             "out_proj",
         ),
     ),
@@ -56,12 +58,18 @@ _CATEGORY_RULES = [
             "ffn_hc_pre",
             "ffn_hc_post",
             "hc_head",
+            "hc_expand",
             "hc_pre",
             "hc_post",
         ),
     ),
     ("residual", ("attn_add", "mlp_add")),
     ("embedding", ("embedding",)),
+    (
+        "engram",
+        ("engram_lookup", "engram_proj", "engram_gate", "engram"),
+    ),
+    ("kv_cache", ("kv_footprint",)),
     ("head", ("lm_head",)),
 ]
 
@@ -82,11 +90,15 @@ def layer_multiplier(
     num_hidden_layers: int,
     num_hash_layers: int = 0,
     num_learned_layers: Optional[int] = None,
+    layer_multipliers: Optional[Mapping[str, int]] = None,
 ) -> int:
     """Match ModelAnalyzer total aggregation weights."""
+    if layer_multipliers and layer_name in layer_multipliers:
+        return int(layer_multipliers[layer_name])
     if (
-        layer_name in ("lm_head", "embedding", "hc_head")
+        layer_name in ("lm_head", "embedding", "hc_head", "hc_expand", "kv_footprint")
         or layer_name.startswith("vision_")
+        or layer_name.startswith("engram_")
     ):
         return 1
     if num_learned_layers is None:
@@ -104,6 +116,7 @@ def aggregate_e2e(
     num_hash_layers: int = 0,
     num_learned_layers: Optional[int] = None,
     metrics: Iterable[str] = ("inference_time", "OPs", "memory_access"),
+    layer_multipliers: Optional[Mapping[str, int]] = None,
 ) -> Dict:
     """Scale per-block ops to network E2E and bucket by category.
 
@@ -129,7 +142,11 @@ def aggregate_e2e(
 
     for name, result in stage_results.items():
         mult = layer_multiplier(
-            name, num_hidden_layers, num_hash_layers, num_learned_layers
+            name,
+            num_hidden_layers,
+            num_hash_layers,
+            num_learned_layers,
+            layer_multipliers,
         )
         cat = categorize_layer(name)
         entry = {"category": cat, "mult": mult}
@@ -165,6 +182,8 @@ def aggregate_e2e(
         "hc",
         "norm",
         "residual",
+        "engram",
+        "kv_cache",
         "head",
         "other",
     ]

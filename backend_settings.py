@@ -12,8 +12,10 @@ avaliable_model_ids_sources = {
     "facebook/opt-6.7b": {"source": "huggingface"},
     "facebook/opt-30b": {"source": "huggingface"},
     "facebook/opt-66b": {"source": "huggingface"},
-    # Phase 1: text backbone + simplified MoE (local params; no HF download required)
+    # Local params; no HF download required.
     "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp": {"source": "DeepSeekV4"},
+    "deepseek-ai/DeepSeek-V4.1-Flash": {"source": "DeepSeekV4"},
+    "DeepSeek-V4.1-Flash": {"source": "DeepSeekV4"},
     # "DiT-XL/2": {"source": "DiT"},
     # "DiT-XL/4": {"source": "DiT"},
 }

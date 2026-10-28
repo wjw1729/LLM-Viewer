@@ -1,10 +1,12 @@
-"""DeepSeek-V4 (Flash / Vision-Exp) — text backbone + MoE + optional ViT encoder.
+"""DeepSeek-V4 and V4.1 cost wiring.
 
-Attention uses a LoRA-style Q/O approximation + MQA KV.
-FFN: first num_hash_layers use hash MoE; remaining layers use learned-gate MoE.
-Vision-Exp adds DeepSeek-ViT + Aligner on the prefill path only.
-Residual path uses Manifold-Constrained Hyper-Connections (mHC).
-Not modeled yet: CSA/HCA hybrid per-layer schedule, MTP/DSpark.
+V4-Flash-Vision-Exp: LoRA Q/O + MQA, hash MoE then learned MoE, optional ViT,
+multi-pass mHC. One attention op is applied to every layer.
+
+V4.1-Flash: CED (20 encoder + 20 decoder), SWA on every layer, CSA2 on the rest,
+learned MoE only, Single-Pass mHC, Engram at layers 1 and 14, DeepSeek-ViT.
+That schedule is built by ops.deepseek_v41_schedule and is not the uniform
+per-layer loop. DSpark is omitted.
 """
 
 from ops.hc import HcDims, embedding_cost, hc_head_cost
@@ -164,7 +166,12 @@ def post_process(model_params, args):
 
     hc = get_hc_info(model_params)
     if hc is not None:
-        for stage, s in (("prefill", seqlen), ("decode", 1)):
+        # V4.1 CED only materializes decoder states for the SWA replay window.
+        hc_prefill_len = seqlen
+        if getattr(model_params, "model_type", "") == "deepseek_v41":
+            win = int(getattr(model_params, "sliding_window", 128) or 128)
+            hc_prefill_len = min(seqlen, win)
+        for stage, s in (("prefill", hc_prefill_len), ("decode", 1)):
             dims = HcDims(
                 batchsize=batchsize,
                 seqlen=s,
@@ -241,6 +248,26 @@ transformer_layer_graph = {
     "ffn_hc_post": ["attn_hc_post", "experts"],
     "output": ["ffn_hc_post"],
 }
+
+def network_costs(model_params, ctx):
+    """Per-op costs for models that are not a repeated homogeneous block.
+
+    Returns None for V4-Flash, which keeps the uniform layer loop.
+    """
+    from ops.deepseek_v41_schedule import build_network
+
+    return build_network(model_params, ctx)
+
+
+def get_transformer_layer_graph(model_params, use_flashattention=False):
+    from ops.deepseek_v41_schedule import is_v41, layer_graph
+
+    if is_v41(model_params):
+        return layer_graph(model_params)
+    if use_flashattention:
+        return flashattention_transformer_layer_graph
+    return transformer_layer_graph
+
 
 flashattention_transformer_layer_graph = {
     "input": [],
