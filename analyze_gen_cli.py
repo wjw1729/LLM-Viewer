@@ -39,6 +39,12 @@ parser.add_argument(
     help="expert-parallel group size; routed experts are sharded across the group",
 )
 parser.add_argument(
+    "--dp-size",
+    type=int,
+    default=1,
+    help="data-parallel group size; the global batch is split across the group",
+)
+parser.add_argument(
     "--attention-type",
     type=str,
     default=None,
@@ -92,6 +98,7 @@ ret = analyzer.analyze_generate_task(
     args.use_flashattention,
     tp_size=args.tp_size,
     ep_size=args.ep_size,
+    dp_size=args.dp_size,
     attention_type=args.attention_type,
     window_size=args.window_size,
     compress_ratio=args.compress_ratio,

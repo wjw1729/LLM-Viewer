@@ -50,6 +50,15 @@
             <option value="8">8</option>
         </select>
     </div>
+    <div class="config_div">
+        Data parallelism
+        <select v-model="dp_size">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="8">8</option>
+        </select>
+    </div>
     <!-- <div class="config_div">
         Generation Length:
         <input type="range" min="1" max="4096" value="1024" oninput="gen_length.innerText = this.value">
@@ -148,6 +157,7 @@ const seq_length = ref(1024);
 const gen_length = ref(1);
 const tp_size = ref(1);
 const ep_size = ref(1);
+const dp_size = ref(1);
 const w_quant = ref('FP16');
 const a_quant = ref('FP16');
 const kv_quant = ref('FP16');
@@ -180,6 +190,12 @@ watch(tp_size, (n) => {
 watch(ep_size, (n) => {
     console.log("ep_size", n)
     global_inference_config.value.ep_size = n
+    global_update_trigger.value += 1
+})
+
+watch(dp_size, (n) => {
+    console.log("dp_size", n)
+    global_inference_config.value.dp_size = n
     global_update_trigger.value += 1
 })
 

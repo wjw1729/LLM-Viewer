@@ -154,6 +154,7 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
     w_bit = int(round(float(ctx["w_byte"]) * 8))
     tp = max(1, int(ctx.get("tp_size") or 1))
     ep = max(1, int(ctx.get("ep_size") or 1))
+    dp = max(1, int(ctx.get("dp_size") or 1))
     link = CommLink(
         bandwidth=float(ctx.get("comm_bandwidth") or 0.0),
         latency=float(ctx.get("comm_latency") or 0.0),
@@ -610,7 +611,7 @@ def build_network(model_params, ctx: dict) -> Optional[dict]:
         f"reindex={dec_reindex}; reuse={len(enc_reuse)}enc+{len(dec_reuse)}dec; "
         f"engram={engram_ids}; engram_host={host:.3e}B; "
         f"kv=fp4_main({main_b:.0f}B)+fp4_index({index_b:.0f}B)+fp8_swa({swa_b:.0f}B); "
-        f"experts=fp{routed_bit}; mhc=single_pass; dspark=off; tp={tp}; ep={ep}"
+        f"experts=fp{routed_bit}; mhc=single_pass; dspark=off; tp={tp}; ep={ep}; dp={dp}"
     )
     return {
         "layers": layers,

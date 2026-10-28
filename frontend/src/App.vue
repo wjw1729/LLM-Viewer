@@ -31,6 +31,7 @@ const global_inference_config = ref({
   gen_length: 1,
   tp_size: 1,
   ep_size: 1,
+  dp_size: 1,
   w_quant: "FP16", 
   a_quant: "FP16", 
   kv_quant: "FP16", 

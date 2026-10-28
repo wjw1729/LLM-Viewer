@@ -226,7 +226,9 @@ class ModelAnalyzer:
                 f.write(
                     f"\n\n=== {self.model_id} {self.hardware} w_bit={self.w_bit} "
                     f"a_bit={self.a_bit} kv_bit={self.kv_bit} batchsize={self.batchsize} "
-                    f"seqlen={self.seqlen} tp_size={self.tp_size} ep_size={self.ep_size} {attn_meta}"
+                    f"global_batchsize={self.global_batchsize} "
+                    f"seqlen={self.seqlen} tp_size={self.tp_size} ep_size={self.ep_size} "
+                    f"dp_size={self.dp_size} {attn_meta}"
                     f"{(' ' + self.analysis_note) if self.analysis_note else ''} ===\n"
                 )
                 f.write(
@@ -333,6 +335,7 @@ class ModelAnalyzer:
         kv_token_ratio=1,
         tp_size: int = 1,
         ep_size: int = 1,
+        dp_size: int = 1,
         attention_type=None,
         window_size=None,
         compress_ratio=None,
@@ -350,6 +353,7 @@ class ModelAnalyzer:
         kv_token_ratio: use this for KV compression
         tp_size: the number of devices for tensor parallelism to use
         ep_size: expert-parallel group size (routed experts are sharded)
+        dp_size: data-parallel group size (global batch is split, no forward collective)
         vision_tokens: LLM-side vision tokens after aligner (0/None disables encoder)
         num_images: number of images in the prompt (prefill only)
 
@@ -393,6 +397,10 @@ class ModelAnalyzer:
         """
         assert seqlen > 0
         assert batchsize > 0
+        self.dp_size = max(1, int(dp_size))
+        self.global_batchsize = int(batchsize)
+        # Each data-parallel rank owns a slice of the global batch. No activation collective.
+        batchsize = math.ceil(self.global_batchsize / self.dp_size)
         self.results = {"decode": {}, "prefill": {}}
         if kv_bit is None:
             kv_bit = a_bit
@@ -452,6 +460,7 @@ class ModelAnalyzer:
                     "kv_byte": kv_byte,
                     "tp_size": tp_size,
                     "ep_size": ep_size,
+                    "dp_size": self.dp_size,
                     "use_flashattention": use_flashattention,
                     "onchip_buffer": onchip_for_net,
                     "comm_bandwidth": self.get_comm_link().bandwidth,
@@ -883,6 +892,7 @@ class ModelAnalyzer:
         use_flashattention = False,
         tp_size: int = 1,
         ep_size: int = 1,
+        dp_size: int = 1,
         attention_type=None,
         window_size=None,
         compress_ratio=None,
@@ -899,6 +909,7 @@ class ModelAnalyzer:
             use_flashattention=use_flashattention,
             tp_size=tp_size,
             ep_size=ep_size,
+            dp_size=dp_size,
             attention_type=attention_type,
             window_size=window_size,
             compress_ratio=compress_ratio,
@@ -918,6 +929,7 @@ class ModelAnalyzer:
                 use_flashattention=use_flashattention,
                 tp_size=tp_size,
                 ep_size=ep_size,
+                dp_size=dp_size,
                 attention_type=attention_type,
                 window_size=window_size,
                 compress_ratio=compress_ratio,
