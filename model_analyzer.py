@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from utils import str_number, str_number_time
 import math
 from ops.attention import AttnDims, create_attention_op
+from ops.comm import CommLink
 from ops.moe import MoeDims, create_moe_op
 from ops.hc import HcDims, block_hc_costs
 from report import aggregate_e2e
@@ -110,10 +111,27 @@ class ModelAnalyzer:
         store_act=0,
         load_kv_cache=0,
         store_kv_cache=0,
+        comm_time=None,
     ):
 
         bandwidth, max_OPS, onchip_buffer = self.get_hardware_info()
         memory_access = load_weight + load_act + store_act + load_kv_cache + store_kv_cache
+        if comm_time is not None:
+            elapsed = float(comm_time)
+            self.results[stage][name] = {
+                "OPs": OPs,
+                "memory_access": memory_access,
+                "arithmetic_intensity": 0,
+                "performance": (memory_access / elapsed) if elapsed > 0 else 0,
+                "bound": "comm",
+                "load_weight": load_weight,
+                "load_act": load_act,
+                "store_act": store_act,
+                "load_kv_cache": load_kv_cache,
+                "store_kv_cache": store_kv_cache,
+                "inference_time": elapsed,
+            }
+            return
         if OPs == 0 and memory_access == 0:
             self.results[stage][name] = {
                 "OPs": 0,
@@ -828,6 +846,13 @@ class ModelAnalyzer:
             max_OPS = hardware_params[self.hardware]["FP16"]
         onchip_buffer = hardware_params[self.hardware]["onchip_buffer"]
         return bandwidth, max_OPS, onchip_buffer
+
+    def get_comm_link(self) -> CommLink:
+        hw = hardware_params[self.hardware]
+        return CommLink(
+            bandwidth=float(hw["comm_bandwidth"]),
+            latency=float(hw["comm_latency"]),
+        )
 
     def get_model_info(self):
         if self.config.get_num_attention_heads(self.model_params) != self.config.get_num_key_value_heads(

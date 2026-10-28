@@ -66,6 +66,10 @@ _CATEGORY_RULES = [
     ("residual", ("attn_add", "mlp_add")),
     ("embedding", ("embedding",)),
     (
+        "comm",
+        ("tp_allreduce", "ep_dispatch", "ep_combine", "tp_allgather"),
+    ),
+    (
         "engram",
         ("engram_lookup", "engram_proj", "engram_gate", "engram"),
     ),
@@ -184,6 +188,7 @@ def aggregate_e2e(
         "residual",
         "engram",
         "kv_cache",
+        "comm",
         "head",
         "other",
     ]

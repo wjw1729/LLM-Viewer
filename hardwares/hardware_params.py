@@ -4,27 +4,101 @@ hardware_params = {
     # NOTICES: For GPU, we use Register File Size as on-chip buffer size
     # https://images.nvidia.com/content/volta-architecture/pdf/volta-architecture-whitepaper.pdf
     # NOTICE: V100 not support INT8 in tensor core, so INT8 performance is not good
-    "nvidia_V100": {"bandwidth": 900e9, "FP16": 112e12, "INT8": 62e12, "onchip_buffer": 20480e3},
+    # comm_bandwidth is unidirectional injection (bytes/s); comm_latency is one collective launch.
+    # NVLink figures are half the published bidirectional rate. PCIe cards use x16 payload rate.
+    "nvidia_V100": {
+        "bandwidth": 900e9,
+        "FP16": 112e12,
+        "INT8": 62e12,
+        "onchip_buffer": 20480e3,
+        "comm_bandwidth": 150e9,  # NVLink2, 300 GB/s bidirectional
+        "comm_latency": 5e-6,
+    },
     # https://images.nvidia.com/aem-dam/en-zz/Solutions/technologies/NVIDIA-ADA-GPU-PROVIZ-Architecture-Whitepaper_1.1.pdf
-    "nvidia_A6000": {"bandwidth": 768e9, "FP16": 154.8e12, "INT8": 309.7e12, "onchip_buffer": 21504e3},
+    "nvidia_A6000": {
+        "bandwidth": 768e9,
+        "FP16": 154.8e12,
+        "INT8": 309.7e12,
+        "onchip_buffer": 21504e3,
+        "comm_bandwidth": 32e9,  # PCIe4 x16
+        "comm_latency": 8e-6,
+    },
     # https://images.nvidia.com/aem-dam/en-zz/Solutions/technologies/NVIDIA-ADA-GPU-PROVIZ-Architecture-Whitepaper_1.1.pdf
-    "nvidia_A6000_Ada": {"bandwidth": 960e9, "FP16": 364.2e12, "INT8": 728.5e12, "onchip_buffer": 36352e3},
+    "nvidia_A6000_Ada": {
+        "bandwidth": 960e9,
+        "FP16": 364.2e12,
+        "INT8": 728.5e12,
+        "onchip_buffer": 36352e3,
+        "comm_bandwidth": 32e9,
+        "comm_latency": 8e-6,
+    },
     # https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
     # Ampere's SM has 256KB RF, max 164KB Shared Mem
-    "nvidia_A100": {"bandwidth": 1555e9, "FP16": 312e12, "INT8": 624e12, "onchip_buffer": 27648e3},  # use 40G data
-    "nvidia_A100_40G": {"bandwidth": 1555e9, "FP16": 312e12, "INT8": 624e12, "onchip_buffer": 27648e3},
-    "nvidia_A100_80G": {"bandwidth": 2039e9, "FP16": 312e12, "INT8": 624e12, "onchip_buffer": 27648e3},
-    "nvidia_A800_80G_SXM": {"bandwidth": 2039e9, "FP16": 312e12, "INT8": 624e12, "onchip_buffer": 27648e3},
-    "nvidia_A40": {"bandwidth": 696e9, "FP16": 149.7e12, "INT8": 299.3e12, "onchip_buffer": 21504e3},
+    "nvidia_A100": {
+        "bandwidth": 1555e9,
+        "FP16": 312e12,
+        "INT8": 624e12,
+        "onchip_buffer": 27648e3,
+        "comm_bandwidth": 300e9,  # NVLink3, 600 GB/s bidirectional
+        "comm_latency": 5e-6,
+    },  # use 40G data
+    "nvidia_A100_40G": {
+        "bandwidth": 1555e9,
+        "FP16": 312e12,
+        "INT8": 624e12,
+        "onchip_buffer": 27648e3,
+        "comm_bandwidth": 300e9,
+        "comm_latency": 5e-6,
+    },
+    "nvidia_A100_80G": {
+        "bandwidth": 2039e9,
+        "FP16": 312e12,
+        "INT8": 624e12,
+        "onchip_buffer": 27648e3,
+        "comm_bandwidth": 300e9,
+        "comm_latency": 5e-6,
+    },
+    "nvidia_A800_80G_SXM": {
+        "bandwidth": 2039e9,
+        "FP16": 312e12,
+        "INT8": 624e12,
+        "onchip_buffer": 27648e3,
+        "comm_bandwidth": 300e9,
+        "comm_latency": 5e-6,
+    },
+    "nvidia_A40": {
+        "bandwidth": 696e9,
+        "FP16": 149.7e12,
+        "INT8": 299.3e12,
+        "onchip_buffer": 21504e3,
+        "comm_bandwidth": 32e9,
+        "comm_latency": 8e-6,
+    },
     # https://resources.nvidia.com/en-us-tensor-core/gtc22-whitepaper-hopper
     "nvidia_H100": {
         "bandwidth": 3072e9,
         "FP16": 1979e12 / 2,
         "INT8": 3958e12 / 2,
         "onchip_buffer": 33792e3,
+        "comm_bandwidth": 450e9,  # NVLink4, 900 GB/s bidirectional
+        "comm_latency": 5e-6,
     },  # use SXM data
-    "nvidia_H100_SXM": {"bandwidth": 3072e9, "FP16": 1979e12 / 2, "INT8": 3958e12 / 2, "onchip_buffer": 33792e3},
-    "nvidia_H100_PCIe": {"bandwidth": 2048e9, "FP16": 1513e12 / 2, "INT8": 3026e12 / 2, "onchip_buffer": 29184e3},
+    "nvidia_H100_SXM": {
+        "bandwidth": 3072e9,
+        "FP16": 1979e12 / 2,
+        "INT8": 3958e12 / 2,
+        "onchip_buffer": 33792e3,
+        "comm_bandwidth": 450e9,
+        "comm_latency": 5e-6,
+    },
+    "nvidia_H100_PCIe": {
+        "bandwidth": 2048e9,
+        "FP16": 1513e12 / 2,
+        "INT8": 3026e12 / 2,
+        "onchip_buffer": 29184e3,
+        "comm_bandwidth": 64e9,  # PCIe5 x16
+        "comm_latency": 8e-6,
+    },
     # https://www.nvidia.com/en-us/data-center/dgx-b200/
     # Blackwell B200: ~160 SMs, RF ~256KB/SM; FP16/INT8 use dense = sparse/2 (same convention as H100)
     "nvidia_B200": {
@@ -32,12 +106,16 @@ hardware_params = {
         "FP16": 4500e12 / 2,
         "INT8": 9000e12 / 2,
         "onchip_buffer": 40960e3,
+        "comm_bandwidth": 900e9,  # NVLink5, 1.8 TB/s bidirectional
+        "comm_latency": 5e-6,
     },
     "nvidia_B200_SXM": {
         "bandwidth": 8000e9,
         "FP16": 4500e12 / 2,
         "INT8": 9000e12 / 2,
         "onchip_buffer": 40960e3,
+        "comm_bandwidth": 900e9,
+        "comm_latency": 5e-6,
     },
     # https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/
     # Blackwell Ultra B300: same FP8/FP16 dense peak class as B200; higher HBM capacity (288GB), bandwidth still 8 TB/s
@@ -46,18 +124,35 @@ hardware_params = {
         "FP16": 4500e12 / 2,
         "INT8": 9000e12 / 2,
         "onchip_buffer": 40960e3,
+        "comm_bandwidth": 900e9,
+        "comm_latency": 5e-6,
     },
     "nvidia_B300_SXM": {
         "bandwidth": 8000e9,
         "FP16": 4500e12 / 2,
         "INT8": 9000e12 / 2,
         "onchip_buffer": 40960e3,
+        "comm_bandwidth": 900e9,
+        "comm_latency": 5e-6,
     },
     # https://images.nvidia.com/aem-dam/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-v2.1.pdf
     # Ada SM has 256 KB Register File, and 128 KB of L1/Shared Memory
-    "nvidia_L40": {"bandwidth": 864e9, "FP16": 181e12, "INT8": 362e12, "onchip_buffer": 36352e3},
+    "nvidia_L40": {
+        "bandwidth": 864e9,
+        "FP16": 181e12,
+        "INT8": 362e12,
+        "onchip_buffer": 36352e3,
+        "comm_bandwidth": 32e9,
+        "comm_latency": 8e-6,
+    },
     # Intel Skylake-X (Skylake-X, Cascade Lake) Intel Xeon Phi (Knights Landing, Knights Mill) Intel Ice Lake, Tiger Lake and Rocket Lake
     # support AVX-512 & FMA (512-bit), they has throughput of 1 cycle
     # https://www.intel.com/content/www/us/en/products/sku/230496/intel-core-i913900k-processor-36m-cache-up-to-5-80-ghz/specifications.html
-    "intel_13900k": {"bandwidth": 89.6e9, "FP16": 8 * 5.4e9 * (512 / 16), "onchip_buffer": 36e6},
+    "intel_13900k": {
+        "bandwidth": 89.6e9,
+        "FP16": 8 * 5.4e9 * (512 / 16),
+        "onchip_buffer": 36e6,
+        "comm_bandwidth": 89.6e9,  # single socket: collectives move through DRAM
+        "comm_latency": 1e-6,
+    },
 }
